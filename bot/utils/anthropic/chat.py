@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import datetime
@@ -198,26 +199,30 @@ async def stream_response(
         if not final_msg or final_msg.stop_reason != "tool_use":
             break
 
-        tool_block = next(
-            (b for b in final_msg.content if b.type == "tool_use"),
-            None,
-        )
-        if not tool_block:
+        tool_blocks = [b for b in final_msg.content if b.type == "tool_use"]
+        if not tool_blocks:
             break
 
-        query = tool_block.input.get("query", "")  # type: ignore[union-attr]
-        logger.info("SearXNG поиск: %s", query)
-        search_result = await _searxng_search(query, config.searxng_url)
+        # Выполняем все поисковые запросы параллельно
+        queries = [b.input.get("query", "") for b in tool_blocks]  # type: ignore[union-attr]
+        logger.info("SearXNG поиск (%d запросов): %s", len(queries), queries)
+        results = await asyncio.gather(
+            *[_searxng_search(q, config.searxng_url) for q in queries]
+        )
+
+        # tool_result для каждого tool_use
+        tool_results = [
+            {
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": result,
+            }
+            for block, result in zip(tool_blocks, results)
+        ]
 
         current_messages = current_messages + [
             {"role": "assistant", "content": final_msg.content},
-            {"role": "user", "content": [
-                {
-                    "type": "tool_result",
-                    "tool_use_id": tool_block.id,
-                    "content": search_result,
-                }
-            ]},
+            {"role": "user", "content": tool_results},
         ]
 
     yield "", anthropic.types.Usage(input_tokens=total_input, output_tokens=total_output)

@@ -24,7 +24,7 @@ fi
 # ──────────────────────────────────────────
 echo "[1/10] Установка системных зависимостей..."
 apt-get update -qq
-apt-get install -y -qq python3 python3-pip python3-venv git curl openssl
+apt-get install -y -qq python3 python3-pip python3-venv git curl openssl rsync
 
 # ──────────────────────────────────────────
 # Docker
@@ -49,8 +49,7 @@ docker --version
 # ──────────────────────────────────────────
 echo "[3/10] Установка Poetry..."
 if ! command -v poetry &>/dev/null; then
-    curl -sSL https://install.python-poetry.org | python3 -
-    export PATH="$HOME/.local/bin:$PATH"
+    curl -sSL https://install.python-poetry.org | POETRY_HOME=/usr/local python3 -
 fi
 poetry --version
 
@@ -79,9 +78,10 @@ chown -R "$APP_USER:$APP_USER" "$APP_DIR"
 # 6. Виртуальное окружение и зависимости
 # ──────────────────────────────────────────
 echo "[6/10] Установка Python-зависимостей через Poetry..."
+POETRY_BIN="/usr/local/bin/poetry"
 cd "$APP_DIR"
-sudo -u "$APP_USER" poetry config virtualenvs.in-project true
-sudo -u "$APP_USER" poetry install --no-root --only main
+sudo -u "$APP_USER" "$POETRY_BIN" config virtualenvs.in-project true
+sudo -u "$APP_USER" "$POETRY_BIN" install --no-root --only main
 
 # ──────────────────────────────────────────
 # 7. SearXNG
@@ -103,7 +103,7 @@ docker run -d \
     --name searxng \
     --restart unless-stopped \
     -p 127.0.0.1:8888:8080 \
-    -v "$SEARXNG_DIR/settings.yml:/etc/searxng/settings.yml:rw" \
+    -v "$SEARXNG_DIR:/etc/searxng:rw" \
     searxng/searxng:latest
 
 echo "   SearXNG запущен на http://127.0.0.1:8888"
@@ -137,7 +137,7 @@ print('БД инициализирована.')
 " 2>/dev/null || echo "БД будет инициализирована при первом запуске."
 
 # ──────────────────────────────────────────
-# 9. Systemd сервисы
+# 10. Systemd сервисы
 # ──────────────────────────────────────────
 echo "[10/10] Регистрация systemd-сервисов..."
 cp "$APP_DIR/deploy/systemd/cltg-bot.service"    /etc/systemd/system/
