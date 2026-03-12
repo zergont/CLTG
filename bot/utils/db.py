@@ -110,6 +110,16 @@ async def get_all_users() -> list[aiosqlite.Row]:
             return await cur.fetchall()
 
 
+async def get_all_active_users() -> list[aiosqlite.Row]:
+    """Возвращает всех незабаненных пользователей для рассылки."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT user_id, first_name FROM users WHERE is_banned = FALSE ORDER BY first_seen"
+        ) as cur:
+            return await cur.fetchall()
+
+
 # ──────────────────────────────────────────
 # История диалогов
 # ──────────────────────────────────────────

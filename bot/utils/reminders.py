@@ -12,6 +12,7 @@ import pytz
 from bot.utils import db
 from bot.utils.anthropic.chat import call_claude_isolated
 from bot.utils.anthropic.models import context_limit
+from bot.utils.errors import handle_telegram_error
 
 if TYPE_CHECKING:
     import anthropic
@@ -115,11 +116,17 @@ async def _fire_reminder(
             history_assistant = text
 
         # Отправляем сообщение
-        await bot.send_message(
-            chat_id=chat_id,
-            text=send_text,
-            disable_notification=silent,
-        )
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=send_text,
+                disable_notification=silent,
+            )
+        except Exception as send_exc:
+            handled = await handle_telegram_error(send_exc, chat_id=chat_id, user_id=user_id)
+            if not handled:
+                raise
+            return  # бот заблокирован — прекращаем обработку
 
         # Добавляем в историю диалога
         history = await db.get_history(chat_id)

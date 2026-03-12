@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
@@ -144,6 +146,22 @@ async def handle_incoming(
     except Exception as exc:
         logger.exception("Ошибка при обращении к Claude: %s", exc)
         await thinking_msg.edit_text(user_error_message(exc))
+        # Уведомляем администратора о неизвестных исключениях (ТЗ п.7.3)
+        is_known = isinstance(exc, (
+            anthropic.RateLimitError,
+            anthropic.InternalServerError,
+            anthropic.AuthenticationError,
+            anthropic.BadRequestError,
+            anthropic.APIConnectionError,
+            asyncio.TimeoutError,
+        ))
+        if not is_known and notify_admin:
+            try:
+                await notify_admin(
+                    f"🚨 Непредвиденная ошибка у chat_id={chat_id}: {type(exc).__name__}: {exc}"
+                )
+            except Exception:
+                pass
         return
 
     # Сохраняем историю

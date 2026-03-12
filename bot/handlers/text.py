@@ -4,10 +4,11 @@ import logging
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
-from aiogram import Router
+from aiogram import Bot, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
 
+from bot.keyboards import setup_commands, get_main_keyboard
 from bot.utils import db
 from bot.utils.anthropic.models import context_limit, MODEL_LABELS
 from bot.utils.reminders import parse_reminder
@@ -22,7 +23,10 @@ router = Router(name="text")
 
 
 @router.message(CommandStart())
-async def cmd_start(message: Message, config: "Config", is_new_user: bool, **kwargs) -> None:
+async def cmd_start(message: Message, bot: Bot, config: "Config", is_new_user: bool, **kwargs) -> None:
+    await setup_commands(bot, config.admin_id)
+    is_admin = message.from_user.id == config.admin_id  # type: ignore[union-attr]
+    kb = get_main_keyboard(is_admin)
     if is_new_user:
         await db.mark_welcomed(message.from_user.id)  # type: ignore[union-attr]
         name = message.from_user.first_name or "друг"  # type: ignore[union-attr]
@@ -32,11 +36,13 @@ async def cmd_start(message: Message, config: "Config", is_new_user: bool, **kwa
             "отвечу на вопросы, помогу с задачами, запомню наш разговор.\n\n"
             "Для справки: /help",
             parse_mode="HTML",
+            reply_markup=kb,
         )
     else:
         await message.answer(
             "👋 С возвращением! Чем могу помочь?\n\n"
-            "Текущий контекст сохранён. Для сброса: /reset"
+            "Текущий контекст сохранён. Для сброса: /reset",
+            reply_markup=kb,
         )
 
 

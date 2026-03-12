@@ -1,0 +1,25 @@
+use_default_settings: true
+
+search:
+  formats:
+    - html
+    - json        # обязательно для HTTP API
+
+server:
+  secret_key: "REPLACE_WITH_GENERATED_KEY"
+  limiter: false  # бот — единственный клиент, лимиты не нужны
+  image_proxy: false
+
+outgoing:
+  request_timeout: 10.0
+
+engines:
+  - name: google
+    engine: google
+    shortcut: g
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: d
+  - name: brave
+    engine: brave
+    shortcut: br

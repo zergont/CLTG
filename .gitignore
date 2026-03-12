@@ -1,11 +1,43 @@
+# Секреты
+# Секреты
 .env
+
+# База данных
 *.db
+
+# Логи
 *.log
+logs/
+
+# Python
 __pycache__/
-.venv/
 *.pyc
 *.pyo
+*.pyd
+
+# Виртуальное окружение
+.venv/
+venv/
+
+# Poetry
 dist/
 build/
 *.egg-info/
+
+# Тесты
 .pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.idea/
+.vscode/
+.vs/
+launch.vs.json
+*.suo
+*.user
+
+# OS
+.DS_Store
+Thumbs.db
+

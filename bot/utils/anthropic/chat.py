@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import AsyncGenerator, Callable, Awaitable
 
 import anthropic
+import httpx
 import pytz
 
 from bot.config import Config
@@ -13,10 +14,95 @@ from bot.utils.errors import with_anthropic_retry
 
 logger = logging.getLogger(__name__)
 
+# Флаг доступности SearXNG, устанавливается при старте через init_searxng()
+_searxng_available: bool = False
+
+# Custom tool — через SearXNG
 WEB_SEARCH_TOOL: dict = {
+    "name": "web_search",
+    "description": (
+        "Поиск актуальной информации в интернете. Используй для вопросов "
+        "о текущих событиях, новостях, погоде, ценах и любой информации, "
+        "которая могла измениться с момента обучения."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Поисковый запрос",
+            }
+        },
+        "required": ["query"],
+    },
+}
+
+
+# Нативный tool Anthropic — fallback если SearXNG недоступен
+NATIVE_WEB_SEARCH_TOOL: dict = {
     "type": "web_search_20250305",
     "name": "web_search",
 }
+
+
+async def init_searxng(url: str, engine: str = "auto") -> bool:
+    """Проверяет доступность SearXNG. Вызывается один раз при старте бота.
+
+    engine: auto | searxng | native
+    """
+    global _searxng_available
+
+    if engine == "native":
+        _searxng_available = False
+        logger.info("🔍 Поисковый движок: нативный Anthropic web_search")
+        return False
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(
+                f"{url}/search",
+                params={"q": "test", "format": "json"},
+            )
+            r.raise_for_status()
+        _searxng_available = True
+        logger.info("✅ Поисковый движок: SearXNG (%s)", url)
+        return True
+    except Exception as exc:
+        _searxng_available = False
+        if engine == "searxng":
+            logger.warning(
+                "⚠️  SearXNG недоступен (%s). Веб-поиск отключён.", exc
+            )
+        else:  # auto
+            logger.warning(
+                "⚠️  SearXNG недоступен (%s). Fallback: нативный Anthropic web_search.", exc
+            )
+        return False
+
+
+async def _searxng_search(query: str, searxng_url: str, max_results: int = 5) -> str:
+    """HTTP-запрос к SearXNG, возвращает текст с результатами."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(
+                f"{searxng_url}/search",
+                params={"q": query, "format": "json", "categories": "general"},
+            )
+            r.raise_for_status()
+            data = r.json()
+            results = data.get("results", [])[:max_results]
+            if not results:
+                return "Поиск не вернул результатов."
+            lines = []
+            for i, item in enumerate(results, 1):
+                title = item.get("title", "")
+                url = item.get("url", "")
+                content = item.get("content", "")
+                lines.append(f"{i}. {title}\n   URL: {url}\n   {content}")
+            return "\n\n".join(lines)
+    except Exception as exc:
+        logger.warning("Ошибка SearXNG поиска: %s", exc)
+        return f"Поиск временно недоступен: {exc}"
 
 
 def _build_system_prompt(config: Config, user_tz: str) -> str:
@@ -59,28 +145,82 @@ async def stream_response(
 ) -> AsyncGenerator[tuple[str, anthropic.Usage | None], None]:
     """Async generator: стриминг ответа Claude.
 
+    Поддерживает agentic loop: если Claude решает искать — выполняет запрос
+    к SearXNG и отправляет результат обратно.
+
     Yields (chunk_text, None) для каждого текстового чанка.
-    Финальный yield: ("", usage).
+    Финальный yield: ("", usage) с суммарным usage всех вызовов.
     """
-    collected_usage: anthropic.Usage | None = None
+    total_input = 0
+    total_output = 0
+    current_messages = list(messages)
 
-    async def _open_stream():
-        return client.messages.stream(
-            model=model,
-            max_tokens=8192,
-            system=system,
-            messages=messages,
-            tools=[WEB_SEARCH_TOOL],  # type: ignore[list-item]
-        )
+    # Fallback на нативный tool если SearXNG недоступен
+    if not _searxng_available:
+        async def _native_stream():
+            return client.messages.stream(
+                model=model,
+                max_tokens=8192,
+                system=system,
+                messages=current_messages,
+                tools=[NATIVE_WEB_SEARCH_TOOL],  # type: ignore[list-item]
+            )
+        stream_cm = await with_anthropic_retry(_native_stream, config)
+        async with stream_cm as stream:
+            async for text_chunk in stream.text_stream:
+                yield text_chunk, None
+            final_msg = await stream.get_final_message()
+        yield "", (final_msg.usage if final_msg else None)
+        return
 
-    stream_cm = await with_anthropic_retry(_open_stream, config)
-    async with stream_cm as stream:
-        async for text_chunk in stream.text_stream:
-            yield text_chunk, None
-        final_msg = await stream.get_final_message()
+    for _iteration in range(3):  # максимум 3 итерации поиска
+        msgs = current_messages
+
+        async def _open_stream(m=msgs):
+            return client.messages.stream(
+                model=model,
+                max_tokens=8192,
+                system=system,
+                messages=m,
+                tools=[WEB_SEARCH_TOOL],  # type: ignore[list-item]
+            )
+
+        stream_cm = await with_anthropic_retry(_open_stream, config)
+        async with stream_cm as stream:
+            async for text_chunk in stream.text_stream:
+                yield text_chunk, None
+            final_msg = await stream.get_final_message()
+
         if final_msg and final_msg.usage:
-            collected_usage = final_msg.usage
-    yield "", collected_usage
+            total_input += final_msg.usage.input_tokens
+            total_output += final_msg.usage.output_tokens
+
+        if not final_msg or final_msg.stop_reason != "tool_use":
+            break
+
+        tool_block = next(
+            (b for b in final_msg.content if b.type == "tool_use"),
+            None,
+        )
+        if not tool_block:
+            break
+
+        query = tool_block.input.get("query", "")  # type: ignore[union-attr]
+        logger.info("SearXNG поиск: %s", query)
+        search_result = await _searxng_search(query, config.searxng_url)
+
+        current_messages = current_messages + [
+            {"role": "assistant", "content": final_msg.content},
+            {"role": "user", "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": tool_block.id,
+                    "content": search_result,
+                }
+            ]},
+        ]
+
+    yield "", anthropic.types.Usage(input_tokens=total_input, output_tokens=total_output)
 
 
 async def call_claude_isolated(

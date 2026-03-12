@@ -22,14 +22,32 @@ fi
 # ──────────────────────────────────────────
 # 2. Системные зависимости
 # ──────────────────────────────────────────
-echo "[1/8] Установка системных зависимостей..."
+echo "[1/10] Установка системных зависимостей..."
 apt-get update -qq
-apt-get install -y -qq python3 python3-pip python3-venv git curl
+apt-get install -y -qq python3 python3-pip python3-venv git curl openssl
+
+# ──────────────────────────────────────────
+# Docker
+# ──────────────────────────────────────────
+echo "[2/10] Установка Docker..."
+if ! command -v docker &>/dev/null; then
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+    chmod a+r /etc/apt/keyrings/docker.asc
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
+https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+        | tee /etc/apt/sources.list.d/docker.list > /dev/null
+    apt-get update -qq
+    apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin
+fi
+systemctl enable docker
+systemctl start docker
+docker --version
 
 # ──────────────────────────────────────────
 # 3. Установка Poetry
 # ──────────────────────────────────────────
-echo "[2/8] Установка Poetry..."
+echo "[3/10] Установка Poetry..."
 if ! command -v poetry &>/dev/null; then
     curl -sSL https://install.python-poetry.org | python3 -
     export PATH="$HOME/.local/bin:$PATH"
@@ -39,7 +57,7 @@ poetry --version
 # ──────────────────────────────────────────
 # 4. Системный пользователь
 # ──────────────────────────────────────────
-echo "[3/8] Создание пользователя $APP_USER..."
+echo "[4/10] Создание пользователя $APP_USER..."
 if ! id "$APP_USER" &>/dev/null; then
     useradd --system --shell /bin/bash --home "$APP_DIR" --create-home "$APP_USER"
 fi
@@ -50,7 +68,7 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
 
-echo "[4/8] Копирование файлов в $APP_DIR..."
+echo "[5/10] Копирование файлов в $APP_DIR..."
 if [[ "$REPO_DIR" != "$APP_DIR" ]]; then
     rsync -a --exclude='.git' --exclude='.venv' --exclude='*.db' --exclude='*.log' \
         "$REPO_DIR/" "$APP_DIR/"
@@ -60,15 +78,40 @@ chown -R "$APP_USER:$APP_USER" "$APP_DIR"
 # ──────────────────────────────────────────
 # 6. Виртуальное окружение и зависимости
 # ──────────────────────────────────────────
-echo "[5/8] Установка Python-зависимостей через Poetry..."
+echo "[6/10] Установка Python-зависимостей через Poetry..."
 cd "$APP_DIR"
 sudo -u "$APP_USER" poetry config virtualenvs.in-project true
 sudo -u "$APP_USER" poetry install --no-root --only main
 
 # ──────────────────────────────────────────
-# 7. Конфигурация
+# 7. SearXNG
 # ──────────────────────────────────────────
-echo "[6/8] Проверка конфигурации..."
+echo "[7/10] Запуск SearXNG (веб-поиск)..."
+SEARXNG_DIR="$APP_DIR/searxng"
+mkdir -p "$SEARXNG_DIR"
+cp "$APP_DIR/deploy/searxng/settings.yml" "$SEARXNG_DIR/settings.yml"
+SECRET_KEY=$(openssl rand -hex 32)
+sed -i "s/REPLACE_WITH_GENERATED_KEY/$SECRET_KEY/" "$SEARXNG_DIR/settings.yml"
+chown -R "$APP_USER:$APP_USER" "$SEARXNG_DIR"
+
+if docker ps -a --format '{{.Names}}' | grep -q '^searxng$'; then
+    echo "   Контейнер searxng уже существует, перезапускаем..."
+    docker stop searxng && docker rm searxng
+fi
+
+docker run -d \
+    --name searxng \
+    --restart unless-stopped \
+    -p 127.0.0.1:8888:8080 \
+    -v "$SEARXNG_DIR/settings.yml:/etc/searxng/settings.yml:rw" \
+    searxng/searxng:latest
+
+echo "   SearXNG запущен на http://127.0.0.1:8888"
+
+# ──────────────────────────────────────────
+# 8. Конфигурация
+# ──────────────────────────────────────────
+echo "[8/10] Проверка конфигурации..."
 if [[ ! -f "$APP_DIR/.env" ]]; then
     cp "$APP_DIR/.env.example" "$APP_DIR/.env"
     chown "$APP_USER:$APP_USER" "$APP_DIR/.env"
@@ -80,9 +123,9 @@ if [[ ! -f "$APP_DIR/.env" ]]; then
 fi
 
 # ──────────────────────────────────────────
-# 8. Инициализация БД
+# 9. БД
 # ──────────────────────────────────────────
-echo "[7/8] Инициализация базы данных..."
+echo "[9/10] Инициализация базы данных..."
 cd "$APP_DIR"
 sudo -u "$APP_USER" .venv/bin/python -c "
 import asyncio
@@ -96,10 +139,35 @@ print('БД инициализирована.')
 # ──────────────────────────────────────────
 # 9. Systemd сервисы
 # ──────────────────────────────────────────
-echo "[8/8] Регистрация systemd-сервисов..."
+echo "[10/10] Регистрация systemd-сервисов..."
 cp "$APP_DIR/deploy/systemd/cltg-bot.service"    /etc/systemd/system/
 cp "$APP_DIR/deploy/systemd/cltg-update.service" /etc/systemd/system/
 cp "$APP_DIR/deploy/systemd/cltg-update.timer"   /etc/systemd/system/
+
+systemctl daemon-reload
+
+# Включить автозапуск
+systemctl enable cltg-bot
+systemctl enable cltg-update.timer
+
+# Запустить, только если .env уже заполнен (есть реальный токен)
+if grep -q "^BOT_TOKEN=.\+" "$APP_DIR/.env" 2>/dev/null; then
+    systemctl start cltg-bot
+    systemctl start cltg-update.timer
+    echo ""
+    echo "✅ Бот запущен как systemd-служба."
+    echo "   Статус:  sudo systemctl status cltg-bot"
+    echo "   Логи:    sudo journalctl -u cltg-bot -f"
+else
+    echo ""
+    echo "⚠️  Заполните конфигурацию и запустите бота вручную:"
+    echo "   sudo nano $APP_DIR/.env"
+    echo "   sudo systemctl start cltg-bot"
+fi
+
+echo ""
+echo "=== Установка завершена ==="
+echo "Автозапуск при перезагрузке сервера: ВКЛЮЧЁН (cltg-bot, cltg-update.timer)"
 
 systemctl daemon-reload
 systemctl enable cltg-bot.service

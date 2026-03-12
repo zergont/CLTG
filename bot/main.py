@@ -12,8 +12,10 @@ from bot.config import load_config
 from bot.keyboards import setup_commands
 from bot.middlewares import RegisterUserMiddleware
 from bot.utils import db
+from bot.utils.errors import handle_telegram_error
 from bot.utils.log import setup_logging
 from bot.utils.reminders import run_scheduler
+from bot.utils.anthropic.chat import init_searxng
 from bot.handlers import text as text_handler
 from bot.handlers import photo as photo_handler
 from bot.handlers import document as document_handler
@@ -30,6 +32,9 @@ async def main() -> None:
 
     # Инициализация БД
     await db.init_db()
+
+    # Проверка SearXNG
+    await init_searxng(config.searxng_url, config.search_engine)
 
     # Anthropic клиент
     client = anthropic.AsyncAnthropic(
@@ -70,10 +75,33 @@ async def main() -> None:
     # Настройка команд в меню Telegram
     await setup_commands(bot, config.admin_id)
 
+    async def broadcast_startup() -> None:
+        """Рассылает приветствие всем активным пользователям при старте бота."""
+        users = await db.get_all_active_users()
+        if not users:
+            return
+        logger.info("Рассылка приветствия %d пользователям...", len(users))
+        ok = 0
+        for user in users:
+            try:
+                name = user["first_name"] or "друг"
+                await bot.send_message(
+                    user["user_id"],
+                    f"👋 Привет, <b>{name}</b>! Бот запущен и готов к работе.",
+                    parse_mode="HTML",
+                )
+                ok += 1
+            except Exception as exc:
+                await handle_telegram_error(exc, chat_id=user["user_id"], user_id=user["user_id"])
+        logger.info("Приветствие отправлено %d/%d пользователям", ok, len(users))
+
     # Запуск планировщика напоминаний
     scheduler_task = asyncio.create_task(
         run_scheduler(bot, config, client)
     )
+
+    # Рассылка приветствия при старте
+    dp.startup.register(broadcast_startup)
 
     logger.info("Бот запущен. Polling...")
 

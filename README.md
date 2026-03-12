@@ -47,6 +47,8 @@ cltg/
 │   └── middlewares.py      # регистрация и проверка бана
 ├── deploy/
 │   ├── install.sh          # скрипт первичной установки
+│   ├── searxng/
+│   │   └── settings.yml    # конфиг SearXNG (веб-поиск)
 │   └── systemd/
 │       ├── cltg-bot.service
 │       ├── cltg-update.service
@@ -110,7 +112,21 @@ git clone https://github.com/zergont/CLTG.git /opt/cltg
 cd /opt/cltg
 ```
 
-#### 2. Запустите скрипт установки
+#### 2. Заполните конфигурацию
+
+```bash
+sudo cp /opt/cltg/.env.example /opt/cltg/.env
+sudo nano /opt/cltg/.env
+```
+
+Обязательно заполните:
+```env
+BOT_TOKEN=ваш_токен_от_botfather
+ADMIN_ID=ваш_telegram_id
+ANTHROPIC_API_KEY=ваш_ключ_anthropic
+```
+
+#### 3. Запустите скрипт установки
 
 ```bash
 sudo bash deploy/install.sh
@@ -122,25 +138,12 @@ sudo bash deploy/install.sh
 - Создаст системного пользователя `cltg`
 - Настроит виртуальное окружение и установит зависимости
 - Инициализирует базу данных из `schema.sql`
-- Зарегистрирует и включит systemd-сервисы
+- Зарегистрирует systemd-сервисы и **включит автозапуск** при старте системы
+- Запустит бота (если `.env` уже заполнен)
 
-#### 3. Заполните конфигурацию
-
-```bash
-sudo nano /opt/cltg/.env
-```
-
-Обязательно заполните:
-```env
-BOT_TOKEN=ваш_токен_от_botfather
-ADMIN_ID=ваш_telegram_id
-ANTHROPIC_API_KEY=ваш_ключ_anthropic
-```
-
-#### 4. Запустите бота
+#### 4. Проверьте статус
 
 ```bash
-sudo systemctl start cltg-bot
 sudo systemctl status cltg-bot
 ```
 

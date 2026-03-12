@@ -63,6 +63,10 @@ class Config:
     # Отладка
     debug_mode: bool
 
+    # SearXNG
+    searxng_url: str
+    search_engine: str  # auto | searxng | native
+
     # Модели (константы)
     model_haiku: str = field(default="claude-haiku-4-5")
     model_sonnet: str = field(default="claude-sonnet-4-6")
@@ -96,4 +100,6 @@ def load_config() -> Config:
         reminder_jitter=_parse_duration_seconds(os.getenv("REMINDER_JITTER", "2s")),
         reminder_default_silent=bool(int(os.getenv("REMINDER_DEFAULT_SILENT", "1"))),
         debug_mode=bool(int(os.getenv("DEBUG_MODE", "0"))),
+        searxng_url=os.getenv("SEARXNG_URL", "http://localhost:8888"),
+        search_engine=os.getenv("SEARCH_ENGINE", "auto"),
     )
