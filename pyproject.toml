@@ -1,0 +1,23 @@
+[tool.poetry]
+name = "cltg"
+version = "1.0.0"
+description = "Family Telegram bot powered by Claude API"
+authors = ["CLTG"]
+readme = "README.md"
+packages = [{include = "bot"}]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+aiogram = "^3.7.0"
+anthropic = "^0.40.0"
+python-dotenv = "^1.0.0"
+aiosqlite = "^0.20.0"
+pytz = "^2024.1"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0.0"
+pytest-asyncio = "^0.23.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

@@ -1,0 +1,13 @@
+[Unit]
+Description=CLTG Bot Auto-Updater
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=cltg
+Group=cltg
+WorkingDirectory=/opt/cltg
+ExecStart=/opt/cltg/update_bot.sh
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cltg-update

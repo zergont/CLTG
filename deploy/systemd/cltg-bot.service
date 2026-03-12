@@ -1,0 +1,25 @@
+[Unit]
+Description=CLTG Telegram Bot (Claude API)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cltg
+Group=cltg
+WorkingDirectory=/opt/cltg
+ExecStart=/opt/cltg/.venv/bin/python -m bot.main
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cltg-bot
+
+# Безопасность
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/cltg
+
+[Install]
+WantedBy=multi-user.target

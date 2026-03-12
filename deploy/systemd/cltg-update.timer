@@ -1,0 +1,11 @@
+[Unit]
+Description=CLTG Bot Auto-Update Timer
+Requires=cltg-update.service
+
+[Timer]
+# Обновление каждую ночь в 03:00
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
