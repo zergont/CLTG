@@ -5,9 +5,9 @@ import logging
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
-from aiogram import Router
+from aiogram import Router, F
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
 from bot.utils import db
 from bot.utils.anthropic.models import context_limit, MODEL_LABELS, AVAILABLE_MODELS
@@ -27,15 +27,47 @@ def _admin_filter(message: Message, config: "Config") -> bool:
 async def cmd_model(message: Message, config: "Config", **kwargs) -> None:
     if not _admin_filter(message, config):
         return
-
     current = await db.get_setting("current_model") or config.model_haiku
-    lines = ["🤖 <b>Выбор модели Claude:</b>\n"]
-    for i, m in enumerate(AVAILABLE_MODELS, 1):
-        mark = " ✅" if m == current else ""
+    await message.answer(
+        "🤖 <b>Выбор модели Claude:</b>",
+        parse_mode="HTML",
+        reply_markup=_model_keyboard(current),
+    )
+
+
+def _model_keyboard(current: str) -> InlineKeyboardMarkup:
+    buttons = []
+    for m in AVAILABLE_MODELS:
         label = MODEL_LABELS.get(m, m)
-        lines.append(f"{i}. <code>{m}</code> — {label}{mark}")
-    lines.append("\nОтправьте строку модели для переключения.")
-    await message.answer("\n".join(lines), parse_mode="HTML")
+        mark = " ✅" if m == current else ""
+        buttons.append([InlineKeyboardButton(
+            text=f"{label}{mark}",
+            callback_data=f"model:{m}",
+        )])
+    buttons.append([InlineKeyboardButton(text="✖ Отмена", callback_data="model:cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@router.callback_query(F.data.startswith("model:"))
+async def cb_model(callback: CallbackQuery, config: "Config", **kwargs) -> None:
+    if callback.from_user.id != config.admin_id:
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+
+    action = callback.data.split(":", 1)[1]  # type: ignore[union-attr]
+
+    if action == "cancel":
+        await callback.message.delete()  # type: ignore[union-attr]
+        await callback.answer()
+        return
+
+    await db.set_setting("current_model", action)
+    label = MODEL_LABELS.get(action, action)
+    await callback.message.edit_text(  # type: ignore[union-attr]
+        f"✅ Модель переключена на <b>{label}</b>",
+        parse_mode="HTML",
+    )
+    await callback.answer()
 
 
 @router.message(lambda m: m.text and m.text.strip() in AVAILABLE_MODELS)

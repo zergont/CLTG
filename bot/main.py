@@ -106,7 +106,7 @@ async def main() -> None:
     logger.info("Бот запущен. Polling...")
 
     try:
-        await dp.start_polling(bot, allowed_updates=["message"])
+        await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
     finally:
         scheduler_task.cancel()
         try:
