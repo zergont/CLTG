@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from aiogram import Bot, Router
@@ -11,7 +10,6 @@ from aiogram.types import Message
 from bot.keyboards import setup_commands, get_main_keyboard
 from bot.utils import db
 from bot.utils.anthropic.models import context_limit, MODEL_LABELS
-from bot.utils.reminders import parse_reminder
 from bot.handlers._common import handle_incoming
 
 if TYPE_CHECKING:
@@ -147,94 +145,10 @@ async def handle_text(
     if not message.text:
         return
 
-    text = message.text
-
-    # Проверяем — вдруг это запрос на напоминание
-    REMINDER_KEYWORDS = ("напомни", "напомнить", "reminder", "каждый", "каждую", "каждое", "ежедневно", "еженедельно")
-    if any(kw in text.lower() for kw in REMINDER_KEYWORDS):
-        await _try_create_reminder(message, config, client, text)
-        return
-
     await handle_incoming(
         message=message,
         config=config,
         client=client,
-        content=text,
+        content=message.text,
         notify_admin=kwargs.get("notify_admin"),
     )
-
-
-async def _try_create_reminder(
-    message: Message,
-    config: "Config",
-    client: "anthropic.AsyncAnthropic",
-    text: str,
-) -> None:
-    """Пытается создать напоминание из текста. При неудаче — обрабатывает как обычный текст."""
-    user_row = await db.get_user(message.from_user.id)  # type: ignore[union-attr]
-    user_tz = user_row["timezone"] if user_row else config.default_timezone
-    model = await db.get_setting("current_model") or config.model_haiku
-
-    parsed = await parse_reminder(client, config, model, text, user_tz)
-
-    if not parsed or not parsed.get("due_at"):
-        # Не похоже на напоминание — обрабатываем как обычный текст
-        await handle_incoming(message=message, config=config, client=client, content=text)
-        return
-
-    try:
-        due_at = datetime.fromisoformat(parsed["due_at"])
-        if due_at.tzinfo is None:
-            due_at = due_at.replace(tzinfo=timezone.utc)
-
-        end_at = None
-        if parsed.get("end_at"):
-            end_at = datetime.fromisoformat(parsed["end_at"])
-            if end_at.tzinfo is None:
-                end_at = end_at.replace(tzinfo=timezone.utc)
-
-        # Сохраняем интервал в meta_json
-        import json
-        meta = {}
-        if parsed.get("interval_seconds"):
-            meta["interval_seconds"] = parsed["interval_seconds"]
-
-        silent = int(parsed.get("silent", 1 if config.reminder_default_silent else 0))
-
-        reminder_id = await db.add_reminder(
-            chat_id=message.chat.id,
-            user_id=message.from_user.id,  # type: ignore[union-attr]
-            text=parsed.get("text", text),
-            due_at=due_at,
-            prompt=parsed.get("prompt"),
-            is_chain=bool(parsed.get("is_chain", False)),
-            silent=silent,
-            steps_left=parsed.get("steps_left"),
-            end_at=end_at,
-        )
-
-        # Обновляем meta_json отдельно если нужно
-        if meta:
-            import aiosqlite
-            from bot.utils.db import DB_PATH
-            async with aiosqlite.connect(DB_PATH) as db_conn:
-                await db_conn.execute(
-                    "UPDATE reminders SET meta_json = ? WHERE id = ?",
-                    (json.dumps(meta), reminder_id),
-                )
-                await db_conn.commit()
-
-        chain_mark = " 🔁" if parsed.get("is_chain") else ""
-        steps_info = f"\nПовторений: {parsed['steps_left']}" if parsed.get("steps_left") else ""
-        silent_mark = " 🔕" if silent else ""
-
-        await message.answer(
-            f"✅ Напоминание создано{chain_mark}{silent_mark}\n\n"
-            f"📝 {parsed.get('text', text)}\n"
-            f"⏰ {due_at.strftime('%d.%m.%Y %H:%M UTC')}"
-            f"{steps_info}\n\n"
-            f"ID: #{reminder_id} (для удаления: /delreminder {reminder_id})"
-        )
-    except Exception:
-        logger.exception("Ошибка создания напоминания")
-        await handle_incoming(message=message, config=config, client=client, content=text)

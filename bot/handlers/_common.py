@@ -108,6 +108,7 @@ async def handle_incoming(
             config=config,
             model=model,
             chat_id=chat_id,
+            user_id=user_id,
             new_content=content,
             user_tz=user_tz,
             db_history=history,

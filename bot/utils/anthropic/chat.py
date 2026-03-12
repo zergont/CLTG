@@ -3,9 +3,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone as dt_timezone
 from typing import AsyncGenerator, Callable, Awaitable
 
+import aiosqlite
 import anthropic
 import httpx
 import pytz
@@ -44,6 +45,86 @@ NATIVE_WEB_SEARCH_TOOL: dict = {
     "type": "web_search_20250305",
     "name": "web_search",
 }
+
+REMINDER_TOOL: dict = {
+    "name": "create_reminder",
+    "description": (
+        "Создаёт напоминание для пользователя. Используй всегда когда пользователь "
+        "просит что-то напомнить, поставить будильник или создать повторяющееся уведомление. "
+        "Время due_at рассчитывай в UTC относительно текущего времени из системного промпта."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "text": {"type": "string", "description": "Текст напоминания"},
+            "due_at": {"type": "string", "description": "Время срабатывания ISO 8601 UTC, пример: 2026-03-12T18:00:00Z"},
+            "is_chain": {"type": "boolean", "description": "true если повторяющееся"},
+            "interval_seconds": {"type": "integer", "description": "Интервал повтора в секундах"},
+            "steps_left": {"type": "integer", "description": "Макс. число срабатываний (без поля = бессрочно)"},
+            "end_at": {"type": "string", "description": "Дата окончания ISO 8601 UTC (без поля = бессрочно)"},
+            "silent": {"type": "integer", "description": "1 = тихий режим, 0 = со звуком"},
+        },
+        "required": ["text", "due_at"],
+    },
+}
+
+
+async def _execute_reminder_tool(
+    tool_input: dict,
+    chat_id: int,
+    user_id: int,
+    default_silent: bool,
+) -> str:
+    """Создаёт напоминание по параметрам от Claude, возвращает строку-результат."""
+    from bot.utils import db as _db
+    try:
+        text = tool_input.get("text", "")
+        due_at = datetime.fromisoformat(tool_input["due_at"].replace("Z", "+00:00"))
+        if due_at.tzinfo is None:
+            due_at = due_at.replace(tzinfo=dt_timezone.utc)
+
+        end_at = None
+        if tool_input.get("end_at"):
+            end_at = datetime.fromisoformat(tool_input["end_at"].replace("Z", "+00:00"))
+            if end_at.tzinfo is None:
+                end_at = end_at.replace(tzinfo=dt_timezone.utc)
+
+        is_chain = bool(tool_input.get("is_chain", False))
+        silent = int(tool_input.get("silent", 1 if default_silent else 0))
+        steps_left = tool_input.get("steps_left")
+        interval_seconds = tool_input.get("interval_seconds")
+
+        reminder_id = await _db.add_reminder(
+            chat_id=chat_id,
+            user_id=user_id,
+            text=text,
+            due_at=due_at,
+            prompt=tool_input.get("prompt"),
+            is_chain=is_chain,
+            silent=silent,
+            steps_left=steps_left,
+            end_at=end_at,
+        )
+
+        if interval_seconds:
+            async with aiosqlite.connect(_db.DB_PATH) as conn:
+                await conn.execute(
+                    "UPDATE reminders SET meta_json = ? WHERE id = ?",
+                    (json.dumps({"interval_seconds": interval_seconds}), reminder_id),
+                )
+                await conn.commit()
+
+        chain_mark = " 🔁" if is_chain else ""
+        silent_mark = " 🔕" if silent else ""
+        steps_info = f", повторений: {steps_left}" if steps_left else ""
+        logger.info("Создано напоминание #%d для user_id=%d: %s", reminder_id, user_id, text)
+        return (
+            f"Напоминание #{reminder_id} успешно создано{chain_mark}{silent_mark}. "
+            f"Текст: «{text}». Время: {due_at.strftime('%d.%m.%Y %H:%M UTC')}{steps_info}."
+        )
+    except Exception as exc:
+        logger.error("Ошибка создания напоминания через tool: %s", exc)
+        return f"Ошибка создания напоминания: {exc}"
 
 
 async def init_searxng(url: str, engine: str = "auto") -> bool:
@@ -107,13 +188,25 @@ async def _searxng_search(query: str, searxng_url: str, max_results: int = 5) ->
 
 
 def _build_system_prompt(config: Config, user_tz: str) -> str:
-    """Добавляет текущее время к системному промпту."""
+    """Добавляет текущее время и описание инструментов к системному промпту."""
     try:
         tz = pytz.timezone(user_tz)
     except pytz.UnknownTimeZoneError:
         tz = pytz.timezone(config.default_timezone)
     now = datetime.now(tz).strftime("%d.%m.%Y %H:%M %Z")
-    return f"{config.system_prompt}\n\nТекущее время: {now}"
+
+    capabilities = (
+        "\n\n## Твои инструменты и возможности\n"
+        "- **web_search**: у тебя есть инструмент веб-поиска. Используй его когда нужна "
+        "актуальная информация — новости, погода, курсы валют, цены, события, свежая документация. "
+        "Не придумывай данные которые могли измениться с момента обучения — лучше поищи.\n"
+        "- **create_reminder**: ты умеешь создавать напоминания через инструмент. Используй его "
+        "всегда когда пользователь просит что-то напомнить, поставить будильник или создать "
+        "повторяющееся уведомление — независимо от формулировки. "
+        "Примеры: «напомни через 30 минут», «каждый день в 9 утра зарядка», «будильник на завтра»."
+    )
+
+    return f"{config.system_prompt}{capabilities}\n\nТекущее время: {now}"
 
 
 def _build_messages(
@@ -143,11 +236,13 @@ async def stream_response(
     model: str,
     messages: list[dict],
     system: str,
+    chat_id: int = 0,
+    user_id: int = 0,
 ) -> AsyncGenerator[tuple[str, anthropic.Usage | None], None]:
     """Async generator: стриминг ответа Claude.
 
-    Поддерживает agentic loop: если Claude решает искать — выполняет запрос
-    к SearXNG и отправляет результат обратно.
+    Поддерживает agentic loop: обрабатывает tool_use блоки (web_search, create_reminder).
+    Если SearXNG недоступен — используется нативный Anthropic web_search (сервер-сайд).
 
     Yields (chunk_text, None) для каждого текстового чанка.
     Финальный yield: ("", usage) с суммарным usage всех вызовов.
@@ -156,25 +251,13 @@ async def stream_response(
     total_output = 0
     current_messages = list(messages)
 
-    # Fallback на нативный tool если SearXNG недоступен
-    if not _searxng_available:
-        async def _native_stream():
-            return client.messages.stream(
-                model=model,
-                max_tokens=8192,
-                system=system,
-                messages=current_messages,
-                tools=[NATIVE_WEB_SEARCH_TOOL],  # type: ignore[list-item]
-            )
-        stream_cm = await with_anthropic_retry(_native_stream, config)
-        async with stream_cm as stream:
-            async for text_chunk in stream.text_stream:
-                yield text_chunk, None
-            final_msg = await stream.get_final_message()
-        yield "", (final_msg.usage if final_msg else None)
-        return
+    active_tools: list[dict] = (
+        [WEB_SEARCH_TOOL, REMINDER_TOOL]
+        if _searxng_available
+        else [NATIVE_WEB_SEARCH_TOOL, REMINDER_TOOL]  # type: ignore[list-item]
+    )
 
-    for _iteration in range(3):  # максимум 3 итерации поиска
+    for _iteration in range(5):  # максимум 5 итераций
         msgs = current_messages
 
         async def _open_stream(m=msgs):
@@ -183,7 +266,7 @@ async def stream_response(
                 max_tokens=8192,
                 system=system,
                 messages=m,
-                tools=[WEB_SEARCH_TOOL],  # type: ignore[list-item]
+                tools=active_tools,  # type: ignore[arg-type]
             )
 
         stream_cm = await with_anthropic_retry(_open_stream, config)
@@ -203,22 +286,44 @@ async def stream_response(
         if not tool_blocks:
             break
 
-        # Выполняем все поисковые запросы параллельно
-        queries = [b.input.get("query", "") for b in tool_blocks]  # type: ignore[union-attr]
-        logger.info("SearXNG поиск (%d запросов): %s", len(queries), queries)
-        results = await asyncio.gather(
-            *[_searxng_search(q, config.searxng_url) for q in queries]
-        )
+        # Разделяем блоки по типу инструмента
+        search_blocks = [b for b in tool_blocks if b.name == "web_search"]
+        reminder_blocks = [b for b in tool_blocks if b.name == "create_reminder"]
 
-        # tool_result для каждого tool_use
-        tool_results = [
-            {
-                "type": "tool_result",
-                "tool_use_id": block.id,
-                "content": result,
-            }
-            for block, result in zip(tool_blocks, results)
-        ]
+        tool_results: list[dict] = []
+
+        # Поисковые запросы выполняем параллельно
+        if search_blocks:
+            queries = [b.input.get("query", "") for b in search_blocks]  # type: ignore[union-attr]
+            logger.info("SearXNG поиск (%d запросов): %s", len(queries), queries)
+            search_results = await asyncio.gather(
+                *[_searxng_search(q, config.searxng_url) for q in queries]
+            )
+            tool_results.extend(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": result,
+                }
+                for block, result in zip(search_blocks, search_results)
+            )
+
+        # Напоминания создаём последовательно (запись в БД)
+        for block in reminder_blocks:
+            logger.info("Создание напоминания через tool: %s", block.input)
+            result = await _execute_reminder_tool(
+                block.input,  # type: ignore[arg-type]
+                chat_id,
+                user_id,
+                config.reminder_default_silent,
+            )
+            tool_results.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": result,
+                }
+            )
 
         current_messages = current_messages + [
             {"role": "assistant", "content": final_msg.content},
@@ -314,6 +419,7 @@ def process_message(
     config: Config,
     model: str,
     chat_id: int,
+    user_id: int,
     new_content: list[dict] | str,
     user_tz: str,
     db_history: dict,
@@ -329,4 +435,4 @@ def process_message(
     summary: str | None = db_history.get("summary")
     system = _build_system_prompt(config, user_tz)
     messages = _build_messages(live_history, summary, new_content)
-    return stream_response(client, config, model, messages, system)
+    return stream_response(client, config, model, messages, system, chat_id=chat_id, user_id=user_id)
