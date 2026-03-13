@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
-from aiogram import Bot, Router
+from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from bot.keyboards import setup_commands, get_main_keyboard
 from bot.utils import db
-from bot.utils.anthropic.models import context_limit, MODEL_LABELS
 from bot.handlers._common import handle_incoming
 
 if TYPE_CHECKING:
@@ -53,8 +53,7 @@ async def cmd_help(message: Message, config: "Config", **kwargs) -> None:
         "/help — эта справка\n"
         "/reset — сбросить контекст диалога\n"
         "/stats — статистика токенов и расходов\n"
-        "/reminders — список активных напоминаний\n"
-        "/delreminder &lt;id&gt; — удалить напоминание\n"
+        "/reminders — список активных напоминаний (с кнопками удаления)\n"
     )
     if is_admin:
         text += (
@@ -99,39 +98,104 @@ async def cmd_stats(message: Message, **kwargs) -> None:
     )
 
 
-@router.message(Command("reminders"))
-async def cmd_reminders(message: Message, **kwargs) -> None:
-    user_id = message.from_user.id  # type: ignore[union-attr]
-    rows = await db.get_user_reminders(user_id)
+def _format_due(due_str: str) -> str:
+    try:
+        dt = datetime.fromisoformat(due_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.strftime("%d.%m.%Y %H:%M UTC")
+    except Exception:
+        return due_str
 
+
+def _reminders_text(rows) -> str:
+    lines = ["🔔 <b>Активные напоминания:</b>\n"]
+    for r in rows:
+        chain_mark = " 🔁" if r["is_chain"] else ""
+        steps = f" (осталось: {r['steps_left']})" if r["steps_left"] else ""
+        lines.append(f"<b>#{r['id']}</b>{chain_mark} — {r['text']}\n   ⏰ {_format_due(r['due_at'])}{steps}")
+    lines.append("\n<i>Нажмите на напоминание чтобы удалить его.</i>")
+    return "\n".join(lines)
+
+
+def _reminders_keyboard(rows) -> InlineKeyboardMarkup:
+    buttons = []
+    for r in rows:
+        chain_mark = " 🔁" if r["is_chain"] else ""
+        label = r["text"]
+        if len(label) > 32:
+            label = label[:31] + "…"
+        buttons.append([InlineKeyboardButton(
+            text=f"🗑 #{r['id']}{chain_mark} — {label}",
+            callback_data=f"rem:del:{r['id']}",
+        )])
+    buttons.append([
+        InlineKeyboardButton(text="🗑 Удалить все", callback_data="rem:delall"),
+        InlineKeyboardButton(text="✖ Закрыть", callback_data="rem:cancel"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def _show_reminders_menu(message: Message, user_id: int) -> None:
+    rows = await db.get_user_reminders(user_id)
     if not rows:
         await message.answer("📭 У вас нет активных напоминаний.")
         return
+    await message.answer(
+        _reminders_text(rows),
+        parse_mode="HTML",
+        reply_markup=_reminders_keyboard(rows),
+    )
 
-    lines = ["🔔 <b>Активные напоминания:</b>\n"]
-    for r in rows:
-        due = r["due_at"]
-        chain_mark = " 🔁" if r["is_chain"] else ""
-        steps = f" (осталось: {r['steps_left']})" if r["steps_left"] else ""
-        lines.append(f"<b>#{r['id']}</b>{chain_mark} — {r['text']}\n   ⏰ {due}{steps}")
 
-    await message.answer("\n".join(lines), parse_mode="HTML")
+@router.message(Command("reminders"))
+async def cmd_reminders(message: Message, **kwargs) -> None:
+    await _show_reminders_menu(message, message.from_user.id)  # type: ignore[union-attr]
 
 
 @router.message(Command("delreminder"))
 async def cmd_delreminder(message: Message, **kwargs) -> None:
-    user_id = message.from_user.id  # type: ignore[union-attr]
-    parts = (message.text or "").split()
-    if len(parts) < 2 or not parts[1].isdigit():
-        await message.answer("❌ Укажите ID напоминания: /delreminder &lt;id&gt;", parse_mode="HTML")
+    await _show_reminders_menu(message, message.from_user.id)  # type: ignore[union-attr]
+
+
+@router.callback_query(F.data.startswith("rem:"))
+async def cb_rem(callback: CallbackQuery, **kwargs) -> None:
+    user_id = callback.from_user.id
+    action = callback.data.split(":", 1)[1]  # type: ignore[union-attr]
+
+    if action == "cancel":
+        await callback.message.delete()  # type: ignore[union-attr]
+        await callback.answer()
         return
 
-    reminder_id = int(parts[1])
-    deleted = await db.delete_reminder(reminder_id, user_id)
-    if deleted:
-        await message.answer(f"✅ Напоминание #{reminder_id} удалено.")
-    else:
-        await message.answer(f"❌ Напоминание #{reminder_id} не найдено.")
+    if action == "delall":
+        count = await db.delete_all_reminders(user_id)
+        await callback.message.edit_text(  # type: ignore[union-attr]
+            f"🗑 Удалено напоминаний: <b>{count}</b>.",
+            parse_mode="HTML",
+        )
+        await callback.answer()
+        return
+
+    if action.startswith("del:"):
+        reminder_id = int(action.split(":", 1)[1])
+        deleted = await db.delete_reminder(reminder_id, user_id)
+        if not deleted:
+            await callback.answer("Напоминание не найдено.", show_alert=True)
+            return
+        rows = await db.get_user_reminders(user_id)
+        if rows:
+            await callback.message.edit_text(  # type: ignore[union-attr]
+                _reminders_text(rows),
+                parse_mode="HTML",
+                reply_markup=_reminders_keyboard(rows),
+            )
+        else:
+            await callback.message.edit_text("📭 Все напоминания удалены.")  # type: ignore[union-attr]
+        await callback.answer(f"✅ Напоминание #{reminder_id} удалено.")
+        return
+
+    await callback.answer()
 
 
 @router.message()

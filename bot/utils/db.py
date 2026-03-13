@@ -332,6 +332,17 @@ async def delete_reminder(reminder_id: int, user_id: int) -> bool:
         return cur.rowcount > 0
 
 
+async def delete_all_reminders(user_id: int) -> int:
+    """Удаляет все активные напоминания пользователя. Возвращает количество удалённых."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "DELETE FROM reminders WHERE user_id = ? AND status = 'scheduled'",
+            (user_id,),
+        )
+        await db.commit()
+        return cur.rowcount
+
+
 async def pick_due_reminders(
     now: datetime,
     lookahead_seconds: int,

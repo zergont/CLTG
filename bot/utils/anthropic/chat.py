@@ -57,7 +57,7 @@ REMINDER_TOOL: dict = {
         "type": "object",
         "properties": {
             "text": {"type": "string", "description": "Текст напоминания"},
-            "due_at": {"type": "string", "description": "Время срабатывания ISO 8601 UTC, пример: 2026-03-12T18:00:00Z"},
+            "due_at": {"type": "string", "description": "Время срабатывания ISO 8601 UTC. Конвертируй из часового пояса пользователя используя смещение из системного промпта. Пример: если сейчас 14:30 UTC+03:00 и нужно через 30 мин → 2026-03-12T12:00:00Z"},
             "is_chain": {"type": "boolean", "description": "true если повторяющееся"},
             "interval_seconds": {"type": "integer", "description": "Интервал повтора в секундах"},
             "steps_left": {"type": "integer", "description": "Макс. число срабатываний (без поля = бессрочно)"},
@@ -193,7 +193,13 @@ def _build_system_prompt(config: Config, user_tz: str) -> str:
         tz = pytz.timezone(user_tz)
     except pytz.UnknownTimeZoneError:
         tz = pytz.timezone(config.default_timezone)
-    now = datetime.now(tz).strftime("%d.%m.%Y %H:%M %Z")
+    now_dt = datetime.now(tz)
+    raw_offset = now_dt.strftime("%z")  # e.g. +0300 or -0530
+    if raw_offset:
+        utc_offset = f"UTC{raw_offset[:3]}:{raw_offset[3:]}"  # UTC+03:00
+    else:
+        utc_offset = "UTC"
+    now = now_dt.strftime(f"%d.%m.%Y %H:%M %Z ({utc_offset})")
 
     capabilities = (
         "\n\n## Твои инструменты и возможности\n"
@@ -203,6 +209,7 @@ def _build_system_prompt(config: Config, user_tz: str) -> str:
         "- **create_reminder**: ты умеешь создавать напоминания через инструмент. Используй его "
         "всегда когда пользователь просит что-то напомнить, поставить будильник или создать "
         "повторяющееся уведомление — независимо от формулировки. "
+        "Для расчёта due_at используй смещение из строки «Текущее время» (например UTC+03:00). "
         "Примеры: «напомни через 30 минут», «каждый день в 9 утра зарядка», «будильник на завтра»."
     )
 
