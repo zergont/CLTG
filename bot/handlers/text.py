@@ -4,6 +4,7 @@ import logging
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
+import pytz
 from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -98,22 +99,23 @@ async def cmd_stats(message: Message, **kwargs) -> None:
     )
 
 
-def _format_due(due_str: str) -> str:
+def _format_due(due_str: str, user_tz: str) -> str:
     try:
         dt = datetime.fromisoformat(due_str)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return dt.strftime("%d.%m.%Y %H:%M UTC")
+        tz = pytz.timezone(user_tz)
+        return dt.astimezone(tz).strftime("%d.%m.%Y %H:%M %Z")
     except Exception:
         return due_str
 
 
-def _reminders_text(rows) -> str:
+def _reminders_text(rows, user_tz: str) -> str:
     lines = ["🔔 <b>Активные напоминания:</b>\n"]
     for r in rows:
         chain_mark = " 🔁" if r["is_chain"] else ""
         steps = f" (осталось: {r['steps_left']})" if r["steps_left"] else ""
-        lines.append(f"<b>#{r['id']}</b>{chain_mark} — {r['text']}\n   ⏰ {_format_due(r['due_at'])}{steps}")
+        lines.append(f"<b>#{r['id']}</b>{chain_mark} — {r['text']}\n   ⏰ {_format_due(r['due_at'], user_tz)}{steps}")
     lines.append("\n<i>Нажмите на напоминание чтобы удалить его.</i>")
     return "\n".join(lines)
 
@@ -136,30 +138,32 @@ def _reminders_keyboard(rows) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-async def _show_reminders_menu(message: Message, user_id: int) -> None:
+async def _show_reminders_menu(message: Message, user_id: int, config: "Config") -> None:
     rows = await db.get_user_reminders(user_id)
     if not rows:
         await message.answer("📭 У вас нет активных напоминаний.")
         return
+    user_row = await db.get_user(user_id)
+    user_tz = user_row["timezone"] if user_row else config.default_timezone
     await message.answer(
-        _reminders_text(rows),
+        _reminders_text(rows, user_tz),
         parse_mode="HTML",
         reply_markup=_reminders_keyboard(rows),
     )
 
 
 @router.message(Command("reminders"))
-async def cmd_reminders(message: Message, **kwargs) -> None:
-    await _show_reminders_menu(message, message.from_user.id)  # type: ignore[union-attr]
+async def cmd_reminders(message: Message, config: "Config", **kwargs) -> None:
+    await _show_reminders_menu(message, message.from_user.id, config)  # type: ignore[union-attr]
 
 
 @router.message(Command("delreminder"))
-async def cmd_delreminder(message: Message, **kwargs) -> None:
-    await _show_reminders_menu(message, message.from_user.id)  # type: ignore[union-attr]
+async def cmd_delreminder(message: Message, config: "Config", **kwargs) -> None:
+    await _show_reminders_menu(message, message.from_user.id, config)  # type: ignore[union-attr]
 
 
 @router.callback_query(F.data.startswith("rem:"))
-async def cb_rem(callback: CallbackQuery, **kwargs) -> None:
+async def cb_rem(callback: CallbackQuery, config: "Config", **kwargs) -> None:
     user_id = callback.from_user.id
     action = callback.data.split(":", 1)[1]  # type: ignore[union-attr]
 
@@ -185,8 +189,10 @@ async def cb_rem(callback: CallbackQuery, **kwargs) -> None:
             return
         rows = await db.get_user_reminders(user_id)
         if rows:
+            user_row = await db.get_user(user_id)
+            user_tz = user_row["timezone"] if user_row else config.default_timezone
             await callback.message.edit_text(  # type: ignore[union-attr]
-                _reminders_text(rows),
+                _reminders_text(rows, user_tz),
                 parse_mode="HTML",
                 reply_markup=_reminders_keyboard(rows),
             )
