@@ -187,8 +187,13 @@ async def _searxng_search(query: str, searxng_url: str, max_results: int = 5) ->
         return f"Поиск временно недоступен: {exc}"
 
 
-def _build_system_prompt(config: Config, user_tz: str) -> str:
-    """Добавляет текущее время и описание инструментов к системному промпту."""
+def _build_system_prompt(config: Config, user_tz: str) -> list[dict]:
+    """Возвращает system-блоки для Claude API с кэшированием статической части.
+
+    Структура:
+      [0] статический блок (промпт + инструменты) — с cache_control
+      [1] динамический блок (текущее время) — без cache_control
+    """
     try:
         tz = pytz.timezone(user_tz)
     except pytz.UnknownTimeZoneError:
@@ -201,19 +206,76 @@ def _build_system_prompt(config: Config, user_tz: str) -> str:
         utc_offset = "UTC"
     now = now_dt.strftime(f"%d.%m.%Y %H:%M %Z ({utc_offset})")
 
+    # --- статическая часть (кэшируется) ---
     capabilities = (
-        "\n\n## Твои инструменты и возможности\n"
-        "- **web_search**: у тебя есть инструмент веб-поиска. Используй его когда нужна "
-        "актуальная информация — новости, погода, курсы валют, цены, события, свежая документация. "
-        "Не придумывай данные которые могли измениться с момента обучения — лучше поищи.\n"
-        "- **create_reminder**: ты умеешь создавать напоминания через инструмент. Используй его "
-        "всегда когда пользователь просит что-то напомнить, поставить будильник или создать "
-        "повторяющееся уведомление — независимо от формулировки. "
-        "Для расчёта due_at используй смещение из строки «Текущее время» (например UTC+03:00). "
-        "Примеры: «напомни через 30 минут», «каждый день в 9 утра зарядка», «будильник на завтра»."
+        "\n\n## Твои инструменты и возможности\n\n"
+        "### 🔍 web_search\n"
+        "Поиск актуальной информации в интернете. Ты вызываешь инструмент с параметром "
+        "`query` — он возвращает список результатов с заголовками, URL и описаниями.\n\n"
+        "**Когда использовать:**\n"
+        "- Вопросы о текущих событиях, новостях, датах мероприятий\n"
+        "- Погода, курсы валют, цены, наличие товаров\n"
+        "- Свежая документация, changelog, совместимость версий\n"
+        "- Любые факты, которые могли измениться после твоего обучения\n"
+        "- Проверка информации, в которой ты не уверен\n\n"
+        "**Когда НЕ использовать:**\n"
+        "- Общие знания, математика, программирование (если не нужна свежая документация)\n"
+        "- Вопросы о самом пользователе или контексте диалога\n\n"
+        "**Советы по запросам:**\n"
+        "- Для технических тем формулируй запрос на английском — результаты будут точнее\n"
+        "- Используй конкретные ключевые слова, а не полные предложения\n"
+        "- Если первый поиск не дал результата — перефразируй запрос\n\n"
+        "### ⏰ create_reminder\n"
+        "Создание напоминаний, будильников и повторяющихся уведомлений.\n\n"
+        "**Когда использовать:**\n"
+        "- Любая просьба напомнить о чём-то: «напомни через 30 минут», «напомни завтра в 9»\n"
+        "- Будильники: «поставь будильник на 7 утра»\n"
+        "- Повторяющиеся уведомления: «каждый день в 9 утра — зарядка», «каждый понедельник — отчёт»\n"
+        "- Таймеры: «через 2 часа напомни выключить духовку»\n\n"
+        "**Расчёт времени (ВАЖНО):**\n"
+        "Параметр `due_at` всегда в UTC. Ты обязан конвертировать локальное время пользователя "
+        "в UTC, используя смещение из строки «Текущее время» ниже.\n\n"
+        "Примеры конвертации (при UTC+03:00):\n"
+        "- «в 9 утра» → ближайшие 09:00 локально → минус 3 часа → 06:00Z\n"
+        "- «через 2 часа» → текущее UTC + 2 часа\n"
+        "- «завтра в 18:00» → завтра 18:00 локально → минус 3 часа → 15:00Z\n\n"
+        "**Повторяющиеся напоминания:**\n"
+        "- Установи `is_chain: true` и `interval_seconds` (3600=час, 86400=день, 604800=неделя)\n"
+        "- `steps_left` — ограничить число повторений (без параметра = бессрочно)\n"
+        "- `end_at` — дата окончания в UTC (без параметра = бессрочно)\n"
+        "- `silent` — 1=без звука (по умолчанию), 0=со звуком\n\n"
+        "### 🧠 Память и контекст\n"
+        "Ты ведёшь непрерывный диалог с пользователем. Между сессиями сохраняется "
+        "структурированное саммари предыдущих разговоров. Запоминай и используй:\n"
+        "- **Имя** — обращайся по имени, если пользователь представился\n"
+        "- **Часовой пояс** — определяется автоматически и указан в «Текущем времени»\n"
+        "- **Ключевые факты** — профессия, локация, предпочтения, проекты над которыми работает\n"
+        "- **Незавершённые задачи** — если в саммари есть открытые вопросы, можешь напомнить о них\n"
+        "- **Стиль общения** — подстраивайся под формальность/неформальность пользователя\n\n"
+        "### 🕐 Текущее время\n"
+        "В каждом запросе указано текущее время пользователя с часовым поясом "
+        "и UTC-смещением. Используй его для:\n"
+        "- Расчёта `due_at` в напоминаниях (конвертация в UTC)\n"
+        "- Понимания относительных выражений («сегодня», «завтра», «через час», «в эту пятницу»)\n"
+        "- Ответов на прямые вопросы о времени и дате\n"
+        "- Определения уместности приветствия (утро/день/вечер)\n"
     )
+    static_text = config.system_prompt + capabilities
 
-    return f"{config.system_prompt}{capabilities}\n\nТекущее время: {now}"
+    # --- динамическая часть (не кэшируется) ---
+    dynamic_text = f"Текущее время: {now}"
+
+    return [
+        {
+            "type": "text",
+            "text": static_text,
+            "cache_control": {"type": "ephemeral"},
+        },
+        {
+            "type": "text",
+            "text": dynamic_text,
+        },
+    ]
 
 
 def _build_messages(
@@ -221,18 +283,63 @@ def _build_messages(
     summary: str | None,
     new_content: list[dict] | str,
 ) -> list[dict]:
-    """Формирует итоговый массив messages[] для API.
+    """Формирует итоговый массив messages[] для API с маркерами кэширования.
 
-    Структура:
-      [summary_user + summary_assistant]  - если есть
-      [... live_history ...]
-      [user: new_content]
+    Структура (с кэшем):
+      [user: SUMMARY + cache_control]     — если есть
+      [assistant: Понял]                  — если есть
+      [... live_history[:-1] ...]
+      [последний элемент истории + cache_control на последнем блоке]
+      [user: new_content]                 — БЕЗ cache_control
     """
     messages: list[dict] = []
+
+    # --- саммари ---
     if summary:
-        messages.append({"role": "user", "content": f"SUMMARY: {summary}"})
-        messages.append({"role": "assistant", "content": "Понял, продолжаем."})
-    messages.extend(live_history)
+        messages.append({
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": f"SUMMARY: {summary}",
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+        })
+        messages.append({
+            "role": "assistant",
+            "content": "Понял, продолжаем.",
+        })
+
+    # --- живая история ---
+    if live_history:
+        # Все сообщения кроме последнего — как есть
+        messages.extend(live_history[:-1])
+
+        # Последнее сообщение истории получает cache_control
+        last = live_history[-1]
+        content = last["content"]
+
+        if isinstance(content, str):
+            cached_content = [
+                {
+                    "type": "text",
+                    "text": content,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
+        elif isinstance(content, list):
+            cached_content = list(content)
+            if cached_content:
+                last_block = dict(cached_content[-1])
+                last_block["cache_control"] = {"type": "ephemeral"}
+                cached_content[-1] = last_block
+        else:
+            cached_content = content
+
+        messages.append({"role": last["role"], "content": cached_content})
+
+    # --- новое сообщение — без кэша ---
     messages.append({"role": "user", "content": new_content})  # type: ignore[arg-type]
     return messages
 
@@ -242,7 +349,7 @@ async def stream_response(
     config: Config,
     model: str,
     messages: list[dict],
-    system: str,
+    system: list[dict],
     chat_id: int = 0,
     user_id: int = 0,
 ) -> AsyncGenerator[tuple[str, anthropic.Usage | None], None]:
@@ -256,6 +363,8 @@ async def stream_response(
     """
     total_input = 0
     total_output = 0
+    total_cache_write = 0
+    total_cache_read = 0
     current_messages = list(messages)
 
     active_tools: list[dict] = (
@@ -285,6 +394,8 @@ async def stream_response(
         if final_msg and final_msg.usage:
             total_input += final_msg.usage.input_tokens
             total_output += final_msg.usage.output_tokens
+            total_cache_write += getattr(final_msg.usage, "cache_creation_input_tokens", 0) or 0
+            total_cache_read += getattr(final_msg.usage, "cache_read_input_tokens", 0) or 0
 
         if not final_msg or final_msg.stop_reason != "tool_use":
             break
@@ -337,7 +448,12 @@ async def stream_response(
             {"role": "user", "content": tool_results},
         ]
 
-    yield "", anthropic.types.Usage(input_tokens=total_input, output_tokens=total_output)
+    yield "", anthropic.types.Usage(
+        input_tokens=total_input,
+        output_tokens=total_output,
+        cache_creation_input_tokens=total_cache_write,
+        cache_read_input_tokens=total_cache_read,
+    )
 
 
 async def call_claude_isolated(

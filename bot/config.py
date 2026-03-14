@@ -43,6 +43,8 @@ class Config:
     price_output_haiku: float
     price_input_sonnet: float
     price_output_sonnet: float
+    price_cache_write_multiplier: float
+    price_cache_read_multiplier: float
 
     # Саммаризация
     summary_trigger_tokens: float
@@ -89,6 +91,8 @@ def load_config() -> Config:
         price_output_haiku=float(os.getenv("ANTHROPIC_PRICE_OUTPUT", "0.000005")),
         price_input_sonnet=float(os.getenv("ANTHROPIC_PRICE_INPUT_SONNET", "0.000003")),
         price_output_sonnet=float(os.getenv("ANTHROPIC_PRICE_OUTPUT_SONNET", "0.000015")),
+        price_cache_write_multiplier=float(os.getenv("ANTHROPIC_PRICE_CACHE_WRITE_MULTIPLIER", "1.25")),
+        price_cache_read_multiplier=float(os.getenv("ANTHROPIC_PRICE_CACHE_READ_MULTIPLIER", "0.10")),
         summary_trigger_tokens=float(os.getenv("SUMMARY_TRIGGER_TOKENS", "0.85")),
         summary_trigger_hours=int(os.getenv("SUMMARY_TRIGGER_HOURS", "72")),
         summary_keep_last=int(os.getenv("SUMMARY_KEEP_LAST", "10")),
@@ -103,3 +107,25 @@ def load_config() -> Config:
         searxng_url=os.getenv("SEARXNG_URL", "http://localhost:8888"),
         search_engine=os.getenv("SEARCH_ENGINE", "auto"),
     )
+
+
+def calc_cost(
+    config: Config,
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    cache_write_tokens: int = 0,
+    cache_read_tokens: int = 0,
+) -> float:
+    """Рассчитывает стоимость запроса с учётом кэш-токенов."""
+    if "sonnet" in model:
+        price_in = config.price_input_sonnet
+        price_out = config.price_output_sonnet
+    else:
+        price_in = config.price_input_haiku
+        price_out = config.price_output_haiku
+
+    cost = input_tokens * price_in + output_tokens * price_out
+    cost += cache_write_tokens * price_in * config.price_cache_write_multiplier
+    cost += cache_read_tokens * price_in * config.price_cache_read_multiplier
+    return cost

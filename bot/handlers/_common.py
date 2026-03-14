@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from __future__ import annotations
-
 import asyncio
 import json
 import logging
@@ -11,6 +9,7 @@ from typing import TYPE_CHECKING, Callable, Awaitable
 import anthropic
 
 from bot.utils import db
+from bot.config import calc_cost
 from bot.utils.anthropic.chat import summarize, process_message, call_claude_isolated
 from bot.utils.anthropic.models import context_limit
 from bot.utils.errors import user_error_message
@@ -26,12 +25,6 @@ logger = logging.getLogger(__name__)
 
 # Интервал обновления стримингового сообщения (секунды)
 STREAM_UPDATE_INTERVAL = 1.5
-
-
-def _get_prices(config: "Config", model: str) -> tuple[float, float]:
-    if "sonnet" in model:
-        return config.price_input_sonnet, config.price_output_sonnet
-    return config.price_input_haiku, config.price_output_haiku
 
 
 async def _try_detect_timezone(
@@ -180,11 +173,15 @@ async def handle_incoming(
     # Логируем usage
     input_tokens = usage.input_tokens if usage else 0
     output_tokens = usage.output_tokens if usage else 0
-    price_input, price_output = _get_prices(config, model)
-    cost = input_tokens * price_input + output_tokens * price_output
+    cache_write = (getattr(usage, "cache_creation_input_tokens", 0) or 0) if usage else 0
+    cache_read = (getattr(usage, "cache_read_input_tokens", 0) or 0) if usage else 0
+    cost = calc_cost(config, model, input_tokens, output_tokens, cache_write, cache_read)
 
     if usage:
-        await db.log_usage(chat_id, user_id, input_tokens, output_tokens, cost, model)
+        await db.log_usage(
+            chat_id, user_id, input_tokens, output_tokens, cost, model,
+            cache_write, cache_read,
+        )
 
     # Обновляем общее приближение токенов
     total_tokens = (history.get("total_tokens_approx") or 0) + input_tokens + output_tokens

@@ -218,14 +218,18 @@ async def log_usage(
     output_tokens: int,
     cost: float,
     model: str,
+    cache_write_tokens: int = 0,
+    cache_read_tokens: int = 0,
 ) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """
-            INSERT INTO usage (chat_id, user_id, input_tokens, output_tokens, cost, model)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO usage (chat_id, user_id, input_tokens, output_tokens,
+                               cache_write_tokens, cache_read_tokens, cost, model)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (chat_id, user_id, input_tokens, output_tokens, cost, model),
+            (chat_id, user_id, input_tokens, output_tokens,
+             cache_write_tokens, cache_read_tokens, cost, model),
         )
         await db.commit()
 
@@ -268,6 +272,30 @@ async def get_global_stats() -> list[aiosqlite.Row]:
             """
         ) as cur:
             return await cur.fetchall()
+
+
+async def get_cache_stats(user_id: int, last_n: int = 20) -> dict:
+    """Возвращает статистику кэширования за последние N запросов."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT
+                COALESCE(SUM(input_tokens), 0)        AS total_input,
+                COALESCE(SUM(cache_write_tokens), 0)   AS total_cache_write,
+                COALESCE(SUM(cache_read_tokens), 0)    AS total_cache_read
+            FROM (
+                SELECT input_tokens, cache_write_tokens, cache_read_tokens
+                FROM usage
+                WHERE user_id = ?
+                ORDER BY ts DESC
+                LIMIT ?
+            )
+            """,
+            (user_id, last_n),
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else {}
 
 
 # ──────────────────────────────────────────

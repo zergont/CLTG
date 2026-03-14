@@ -215,10 +215,23 @@ async def cmd_context(message: Message, config: "Config", **kwargs) -> None:
             except ValueError:
                 pass
 
+        # Статистика кэширования за последние 20 запросов
+        cache = await db.get_cache_stats(r["user_id"])
+        total_all = (
+            (cache.get("total_input") or 0)
+            + (cache.get("total_cache_write") or 0)
+            + (cache.get("total_cache_read") or 0)
+        )
+        cache_read_pct = (
+            (cache.get("total_cache_read") or 0) / total_all * 100
+            if total_all > 0 else 0.0
+        )
+
         uname = f"@{r['username']}" if r["username"] else str(r["user_id"])
         lines.append(
             f"• {uname}: {pct:.1f}% ({tokens:,} / {limit:,})\n"
-            f"  пар: {pairs}, саммари: {has_summary}, последнее: {last_msg}"
+            f"  пар: {pairs}, саммари: {has_summary}, "
+            f"cache: {cache_read_pct:.0f}%, последнее: {last_msg}"
         )
 
     if len(lines) == 1:

@@ -38,6 +38,8 @@ CREATE TABLE IF NOT EXISTS usage (
     user_id        INTEGER,
     input_tokens   INTEGER DEFAULT 0,
     output_tokens  INTEGER DEFAULT 0,
+    cache_write_tokens INTEGER DEFAULT 0,
+    cache_read_tokens  INTEGER DEFAULT 0,
     cost           REAL    NOT NULL,
     model          TEXT    NOT NULL,
     ts             DATETIME DEFAULT CURRENT_TIMESTAMP

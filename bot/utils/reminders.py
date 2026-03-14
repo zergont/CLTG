@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 import pytz
 
 from bot.utils import db
+from bot.config import calc_cost
 from bot.utils.anthropic.chat import call_claude_isolated
 from bot.utils.anthropic.models import context_limit
 from bot.utils.errors import handle_telegram_error
@@ -103,9 +104,13 @@ async def _fire_reminder(
                 client, config, model, prompt
             )
             # Логируем стоимость
-            price_input, price_output = _get_prices(config, model)
-            cost = usage.input_tokens * price_input + usage.output_tokens * price_output
-            await db.log_usage(chat_id, user_id, usage.input_tokens, usage.output_tokens, cost, model)
+            cache_write = getattr(usage, "cache_creation_input_tokens", 0) or 0
+            cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
+            cost = calc_cost(config, model, usage.input_tokens, usage.output_tokens, cache_write, cache_read)
+            await db.log_usage(
+                chat_id, user_id, usage.input_tokens, usage.output_tokens, cost, model,
+                cache_write, cache_read,
+            )
 
             send_text = response_text
             history_user = f"🔔 REMINDER: {text}"
@@ -175,12 +180,6 @@ async def _fire_reminder(
 
     except Exception as e:
         logger.exception("Ошибка при обработке напоминания #%d: %s", reminder_id, e)
-
-
-def _get_prices(config: "Config", model: str) -> tuple[float, float]:
-    if "sonnet" in model:
-        return config.price_input_sonnet, config.price_output_sonnet
-    return config.price_input_haiku, config.price_output_haiku
 
 
 async def parse_reminder(
