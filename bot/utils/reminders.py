@@ -12,7 +12,6 @@ import pytz
 from bot.utils import db
 from bot.config import calc_cost
 from bot.utils.anthropic.chat import call_claude_isolated
-from bot.utils.anthropic.models import context_limit
 from bot.utils.errors import handle_telegram_error
 
 if TYPE_CHECKING:

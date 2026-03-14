@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from aiogram import Router, F
@@ -11,6 +11,7 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 
 from bot.utils import db
 from bot.utils.anthropic.models import context_limit, MODEL_LABELS, AVAILABLE_MODELS
+from bot.utils.html import split_long_message
 
 if TYPE_CHECKING:
     from bot.config import Config
@@ -142,7 +143,6 @@ async def cmd_users(message: Message, config: "Config", **kwargs) -> None:
         lines.append(f"{status} <code>{r['user_id']}</code> {name} ({uname})")
 
     # Разбиваем если длинный список
-    from bot.utils.html import split_long_message
     full_text = "\n".join(lines)
     parts = split_long_message(full_text)
     for part in parts:
@@ -169,7 +169,6 @@ async def cmd_usage(message: Message, config: "Config", **kwargs) -> None:
             f"• {name} ({uname}): <b>${cost:.4f}</b> / {req} запросов"
         )
 
-    from bot.utils.html import split_long_message
     full_text = "\n".join(lines)
     parts = split_long_message(full_text)
     for part in parts:
@@ -237,7 +236,6 @@ async def cmd_context(message: Message, config: "Config", **kwargs) -> None:
     if len(lines) == 1:
         lines.append("Нет истории ни у одного пользователя.")
 
-    from bot.utils.html import split_long_message
     full_text = "\n".join(lines)
     parts = split_long_message(full_text)
     for part in parts:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import asyncio
-from typing import Callable, Awaitable, Any, TypeVar
+from typing import Callable, Awaitable, TypeVar
 
 import anthropic
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter

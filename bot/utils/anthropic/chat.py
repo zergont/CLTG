@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timezone as dt_timezone
-from typing import AsyncGenerator, Callable, Awaitable
+from typing import AsyncGenerator
 
 import aiosqlite
 import anthropic
@@ -546,7 +546,6 @@ def process_message(
     new_content: list[dict] | str,
     user_tz: str,
     db_history: dict,
-    notify_admin: Callable[[str], Awaitable[None]] | None = None,
 ) -> AsyncGenerator[tuple[str, anthropic.Usage | None], None]:
     """Точка входа для обработки входящего сообщения.
 

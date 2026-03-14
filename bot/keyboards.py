@@ -18,7 +18,6 @@ USER_COMMANDS = [
     BotCommand(command="reset",       description="Сбросить контекст диалога"),
     BotCommand(command="stats",       description="Статистика токенов и расходов"),
     BotCommand(command="reminders",   description="Список активных напоминаний"),
-    BotCommand(command="delreminder", description="Удалить напоминание: /delreminder <id>"),
 ]
 
 ADMIN_COMMANDS = USER_COMMANDS + [

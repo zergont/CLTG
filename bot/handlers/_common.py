@@ -105,7 +105,6 @@ async def handle_incoming(
             new_content=content,
             user_tz=user_tz,
             db_history=history,
-            notify_admin=notify_admin,
         )
 
         full_text = ""
@@ -164,10 +163,7 @@ async def handle_incoming(
     summary_text = history.get("summary")
 
     # Добавляем новые пары
-    if isinstance(content, str):
-        live_history.append({"role": "user", "content": content})
-    else:
-        live_history.append({"role": "user", "content": content})
+    live_history.append({"role": "user", "content": content})
     live_history.append({"role": "assistant", "content": full_text})
 
     # Логируем usage

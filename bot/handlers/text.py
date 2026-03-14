@@ -157,11 +157,6 @@ async def cmd_reminders(message: Message, config: "Config", **kwargs) -> None:
     await _show_reminders_menu(message, message.from_user.id, config)  # type: ignore[union-attr]
 
 
-@router.message(Command("delreminder"))
-async def cmd_delreminder(message: Message, config: "Config", **kwargs) -> None:
-    await _show_reminders_menu(message, message.from_user.id, config)  # type: ignore[union-attr]
-
-
 @router.callback_query(F.data.startswith("rem:"))
 async def cb_rem(callback: CallbackQuery, config: "Config", **kwargs) -> None:
     user_id = callback.from_user.id

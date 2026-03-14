@@ -1,1 +1,0 @@
-import sqlite3, os; db="cltg.db"; f=open("_result.txt","w"); f.write("exists: "+str(os.path.exists(db))+"\n"); c=sqlite3.connect(db); f.write("cols: "+str([r[1] for r in c.execute("PRAGMA table_info(usage)")])+"\n"); f.write("hist: "+str(c.execute("SELECT COUNT(*) FROM chat_history").fetchone()[0])+"\n"); c.close(); f.close()
