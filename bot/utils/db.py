@@ -12,13 +12,40 @@ DB_PATH = "cltg.db"
 
 
 async def init_db() -> None:
-    """Инициализирует БД из schema.sql."""
+    """Инициализирует БД из schema.sql и применяет миграции."""
     with open("schema.sql", encoding="utf-8") as f:
         schema = f.read()
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.executescript(schema)
-        await db.commit()
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.executescript(schema)
+        await conn.commit()
+
+        # Миграции для существующих БД
+        await _migrate(conn)
+
     logger.info("База данных инициализирована")
+
+
+async def _migrate(conn: aiosqlite.Connection) -> None:
+    """Добавляет недостающие колонки в существующие таблицы."""
+    # usage: cache_write_tokens, cache_read_tokens (v1.1.0)
+    cursor = await conn.execute("PRAGMA table_info(usage)")
+    columns = {row[1] for row in await cursor.fetchall()}
+
+    added = False
+    if "cache_write_tokens" not in columns:
+        await conn.execute(
+            "ALTER TABLE usage ADD COLUMN cache_write_tokens INTEGER DEFAULT 0"
+        )
+        added = True
+    if "cache_read_tokens" not in columns:
+        await conn.execute(
+            "ALTER TABLE usage ADD COLUMN cache_read_tokens INTEGER DEFAULT 0"
+        )
+        added = True
+
+    if added:
+        await conn.commit()
+        logger.info("Миграция: добавлены колонки cache_write_tokens, cache_read_tokens")
 
 
 # ──────────────────────────────────────────
