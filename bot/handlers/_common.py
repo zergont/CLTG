@@ -131,7 +131,7 @@ async def handle_incoming(
         if not full_text:
             full_text = "_(пустой ответ)_"
 
-        parts = split_long_message(markdown_to_html(full_text))
+        parts = [markdown_to_html(part) for part in split_long_message(full_text)]
         await thinking_msg.edit_text(parts[0], parse_mode="HTML")
         for part in parts[1:]:
             await message.answer(part, parse_mode="HTML")

@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "cltg"
-version = "1.1.1"
+version = "1.1.2"
 description = "Family Telegram bot powered by Claude API"
 authors = ["CLTG"]
 readme = "README.md"
