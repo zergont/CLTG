@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import base64
+import io
 import logging
 from typing import TYPE_CHECKING
 
 from aiogram import Router
 from aiogram.types import Message
+from PIL import Image
 
 from bot.handlers._common import handle_incoming
 
@@ -18,6 +20,19 @@ router = Router(name="photo")
 
 # Максимальный размер изображения для передачи в Claude (байты)
 MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5 МБ
+# Максимальная сторона при наличии нескольких изображений в контексте
+MAX_IMAGE_SIDE = 2000
+
+
+def _resize_image(data: bytes, max_side: int = MAX_IMAGE_SIDE) -> bytes:
+    """Сжимает изображение до max_side px по большей стороне, если нужно."""
+    img = Image.open(io.BytesIO(data))
+    if max(img.width, img.height) <= max_side:
+        return data
+    img.thumbnail((max_side, max_side), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=90)
+    return buf.getvalue()
 
 
 @router.message(lambda m: m.photo is not None)
@@ -39,7 +54,9 @@ async def handle_photo(
     try:
         file = await message.bot.get_file(photo.file_id)  # type: ignore[union-attr]
         file_bytes = await message.bot.download_file(file.file_path)  # type: ignore[union-attr]
-        image_data = base64.standard_b64encode(file_bytes.read()).decode()  # type: ignore[union-attr]
+        raw = file_bytes.read()  # type: ignore[union-attr]
+        raw = _resize_image(raw)
+        image_data = base64.standard_b64encode(raw).decode()
     except Exception:
         logger.exception("Ошибка загрузки фото")
         await message.answer("❌ Не удалось загрузить изображение. Попробуйте ещё раз.")
