@@ -278,6 +278,28 @@ def _build_system_prompt(config: Config, user_tz: str) -> list[dict]:
     ]
 
 
+def _strip_images_from_history(messages: list[dict]) -> list[dict]:
+    """Заменяет base64-изображения в истории на текстовый плейсхолдер.
+
+    Модель уже видела эти изображения и ответила на них — хранить base64
+    в контексте бессмысленно и вызывает ошибку при накоплении many-image.
+    """
+    result = []
+    for msg in messages:
+        content = msg["content"]
+        if not isinstance(content, list):
+            result.append(msg)
+            continue
+        new_content = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") in ("image", "document"):
+                new_content.append({"type": "text", "text": "[изображение из предыдущего сообщения]"})
+            else:
+                new_content.append(block)
+        result.append({"role": msg["role"], "content": new_content})
+    return result
+
+
 def _build_messages(
     live_history: list[dict],
     summary: str | None,
@@ -311,13 +333,15 @@ def _build_messages(
             "content": "Понял, продолжаем.",
         })
 
-    # --- живая история ---
+    # --- живая история (изображения заменяем плейсхолдером) ---
     if live_history:
+        clean_history = _strip_images_from_history(live_history)
+
         # Все сообщения кроме последнего — как есть
-        messages.extend(live_history[:-1])
+        messages.extend(clean_history[:-1])
 
         # Последнее сообщение истории получает cache_control
-        last = live_history[-1]
+        last = clean_history[-1]
         content = last["content"]
 
         if isinstance(content, str):
