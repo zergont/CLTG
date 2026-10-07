@@ -15,7 +15,8 @@ from aiogram import Bot
 USER_COMMANDS = [
     BotCommand(command="start",       description="Приветствие и регистрация"),
     BotCommand(command="help",        description="Список команд"),
-    BotCommand(command="reset",       description="Сбросить контекст диалога"),
+    BotCommand(command="reset",       description="Новый разговор (факты о вас сохранятся)"),
+    BotCommand(command="kill",        description="Забыть всё, включая факты о вас"),
     BotCommand(command="stats",       description="Статистика токенов и расходов"),
     BotCommand(command="reminders",   description="Список активных напоминаний"),
 ]

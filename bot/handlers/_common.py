@@ -16,6 +16,7 @@ from bot.utils.anthropic.chat import (
     TurnUsage,
     call_claude_isolated,
     display_name,
+    extract_facts,
     process_message,
     summarize,
 )
@@ -84,6 +85,47 @@ async def _try_detect_timezone(
         logger.debug("Модель вернула неизвестный часовой пояс")
     except Exception:
         logger.debug("Не удалось определить часовой пояс", exc_info=True)
+
+
+async def reset_dialogue(
+    client: anthropic.AsyncAnthropic,
+    config: "Config",
+    chat_id: int,
+    user_id: int,
+) -> bool:
+    """/reset: очищает диалог, но сохраняет долговременные факты о пользователе.
+
+    Факты берутся и из саммари, и из живой истории (там могут быть ещё не
+    сохранённые в саммари). Возвращает True, если факты сохранены.
+    При ошибке модели пробрасывает исключение — память остаётся нетронутой.
+    """
+    history = await db.get_history(chat_id)
+    live_history: list[dict] = json.loads(history.get("messages_json") or "[]")
+    prev_summary = history.get("summary")
+
+    if not live_history and not prev_summary:
+        await db.reset_history(chat_id)
+        return False
+
+    model, _ = await db.get_model_settings()
+    facts, usage = await extract_facts(client, config, model, live_history, prev_summary)
+    await db.log_usage(
+        chat_id, user_id, usage.input_tokens, usage.output_tokens, usage.cost, model.id,
+        usage.cache_write_tokens, usage.cache_read_tokens,
+    )
+
+    if not facts:
+        await db.reset_history(chat_id)
+        return False
+
+    await db.save_history(
+        chat_id=chat_id,
+        messages=[],
+        total_tokens=0,
+        summary=facts,
+        summary_updated_at=datetime.now(timezone.utc),
+    )
+    return True
 
 
 async def _send_answer(placeholder: "Message", message: "Message", text: str) -> None:
@@ -253,8 +295,8 @@ async def handle_incoming(
         except Exception:
             logger.exception("Ошибка саммаризации для chat_id=%d", chat_id)
 
-    # Фоновое определение часового пояса (раз в 10 сообщений)
-    if len(live_history) % 10 == 0:
+    # Фоновое определение часового пояса (раз в 10 сообщений; после саммаризации история пуста)
+    if live_history and len(live_history) % 10 == 0:
         task = asyncio.create_task(
             _try_detect_timezone(client, config, model, user_id, live_history)
         )

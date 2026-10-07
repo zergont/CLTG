@@ -11,7 +11,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from bot.keyboards import setup_commands, get_main_keyboard
 from bot.utils import db
-from bot.handlers._common import handle_incoming
+from bot.handlers._common import TRANSIENT_API_ERRORS, handle_incoming, reset_dialogue
 
 if TYPE_CHECKING:
     import anthropic
@@ -40,7 +40,7 @@ async def cmd_start(message: Message, bot: Bot, config: "Config", is_new_user: b
     else:
         await message.answer(
             "👋 С возвращением! Чем могу помочь?\n\n"
-            "Текущий контекст сохранён. Для сброса: /reset",
+            "Текущий контекст сохранён. Начать новый разговор: /reset",
             reply_markup=kb,
         )
 
@@ -52,7 +52,8 @@ async def cmd_help(message: Message, config: "Config", **kwargs) -> None:
         "📋 <b>Доступные команды:</b>\n\n"
         "/start — приветствие\n"
         "/help — эта справка\n"
-        "/reset — сбросить контекст диалога\n"
+        "/reset — начать новый разговор (факты о вас сохранятся)\n"
+        "/kill — забыть всё, включая факты о вас\n"
         "/stats — статистика токенов и расходов\n"
         "/reminders — список активных напоминаний (с кнопками удаления)\n"
     )
@@ -70,12 +71,69 @@ async def cmd_help(message: Message, config: "Config", **kwargs) -> None:
 
 
 @router.message(Command("reset"))
-async def cmd_reset(message: Message, **kwargs) -> None:
-    await db.reset_history(message.chat.id)
+async def cmd_reset(
+    message: Message,
+    config: "Config",
+    client: "anthropic.AsyncAnthropic",
+    **kwargs,
+) -> None:
+    """Новый разговор: история очищается, долговременные факты о пользователе остаются."""
+    status = await message.answer("⏳ Начинаю новый разговор, сохраняю факты о вас…")
+    try:
+        kept = await reset_dialogue(
+            client, config, message.chat.id, message.from_user.id,  # type: ignore[union-attr]
+        )
+    except Exception as exc:
+        if isinstance(exc, TRANSIENT_API_ERRORS):
+            logger.warning("Временная ошибка Claude API при /reset chat_id=%d: %r", message.chat.id, exc)
+        else:
+            logger.exception("Ошибка /reset для chat_id=%d", message.chat.id)
+        await status.edit_text(
+            "❌ Не удалось сохранить факты, поэтому диалог не сброшен. Попробуйте позже.\n"
+            "Забыть всё без сохранения: /kill"
+        )
+        return
+
+    if kept:
+        await status.edit_text(
+            "🔄 Начинаем новый разговор. Факты о вас я помню.\n"
+            "<i>Забыть всё: /kill</i>",
+            parse_mode="HTML",
+        )
+    else:
+        await status.edit_text("🔄 Начинаем с чистого листа!")
+
+
+_KILL_KEYBOARD = InlineKeyboardMarkup(inline_keyboard=[[
+    InlineKeyboardButton(text="🗑 Да, забыть всё", callback_data="kill:yes"),
+    InlineKeyboardButton(text="✖ Отмена", callback_data="kill:no"),
+]])
+
+
+@router.message(Command("kill"))
+async def cmd_kill(message: Message, **kwargs) -> None:
+    """Полное забывание — с подтверждением, чтобы не стереть память случайно."""
     await message.answer(
-        "🔄 Контекст диалога сброшен. История и саммари очищены.\n"
-        "Начинаем с чистого листа!"
+        "⚠️ <b>Забыть всё?</b>\n\n"
+        "Я удалю историю разговоров и всё, что помню о вас: имя, факты, предпочтения. "
+        "Отменить это будет нельзя.\n"
+        "<i>Напоминания останутся — ими управляет /reminders.</i>",
+        parse_mode="HTML",
+        reply_markup=_KILL_KEYBOARD,
     )
+
+
+@router.callback_query(F.data.startswith("kill:"))
+async def cb_kill(callback: CallbackQuery, **kwargs) -> None:
+    if callback.data == "kill:yes":
+        await db.reset_history(callback.message.chat.id)  # type: ignore[union-attr]
+        logger.info("Память очищена (/kill) для chat_id=%d", callback.message.chat.id)  # type: ignore[union-attr]
+        await callback.message.edit_text(  # type: ignore[union-attr]
+            "🧹 Готово: вся память очищена. Начнём знакомство заново!"
+        )
+    else:
+        await callback.message.edit_text("👌 Отменено, я всё помню.")  # type: ignore[union-attr]
+    await callback.answer()
 
 
 @router.message(Command("stats"))
