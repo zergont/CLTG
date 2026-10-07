@@ -7,10 +7,7 @@ import random
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
-import pytz
-
 from bot.utils import db
-from bot.config import calc_cost
 from bot.utils.anthropic.chat import call_claude_isolated
 from bot.utils.errors import handle_telegram_error
 
@@ -93,31 +90,27 @@ async def _fire_reminder(
     meta = json.loads(reminder["meta_json"]) if reminder.get("meta_json") else {}
 
     try:
-        # Получаем текущую модель
-        model = await db.get_setting("current_model") or config.model_haiku
+        send_text = f"🔔 {text}"
+        history_user = f"🔔 REMINDER: {text}"
+        history_assistant = text
 
-        # Определяем текст для отправки
         if prompt:
-            # Вызов Claude с изолированным промптом
-            response_text, usage = await call_claude_isolated(
-                client, config, model, prompt
-            )
-            # Логируем стоимость
-            cache_write = getattr(usage, "cache_creation_input_tokens", 0) or 0
-            cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
-            cost = calc_cost(config, model, usage.input_tokens, usage.output_tokens, cache_write, cache_read)
-            await db.log_usage(
-                chat_id, user_id, usage.input_tokens, usage.output_tokens, cost, model,
-                cache_write, cache_read,
-            )
-
-            send_text = response_text
-            history_user = f"🔔 REMINDER: {text}"
-            history_assistant = response_text
-        else:
-            send_text = f"🔔 {text}"
-            history_user = f"🔔 REMINDER: {text}"
-            history_assistant = text
+            # Вызов Claude с изолированным промптом на текущей модели
+            model, effort = await db.get_model_settings()
+            try:
+                response_text, usage = await call_claude_isolated(
+                    client, config, model, prompt, effort=effort,
+                )
+                await db.log_usage(
+                    chat_id, user_id, usage.input_tokens, usage.output_tokens, usage.cost,
+                    model.id, usage.cache_write_tokens, usage.cache_read_tokens,
+                )
+                if response_text.strip():
+                    send_text = response_text
+                    history_assistant = response_text
+            except Exception:
+                # Не удалось сгенерировать — отправляем обычный текст напоминания
+                logger.exception("Ошибка генерации текста напоминания #%d", reminder_id)
 
         # Отправляем сообщение
         try:
@@ -179,42 +172,3 @@ async def _fire_reminder(
 
     except Exception as e:
         logger.exception("Ошибка при обработке напоминания #%d: %s", reminder_id, e)
-
-
-async def parse_reminder(
-    client: "anthropic.AsyncAnthropic",
-    config: "Config",
-    model: str,
-    user_text: str,
-    user_tz: str,
-) -> dict | None:
-    """
-    Парсит текст пользователя в параметры напоминания через Claude.
-    Возвращает dict с параметрами или None при ошибке.
-    """
-    from bot.utils.prompts import REMINDER_PARSE_PROMPT
-
-    try:
-        tz = pytz.timezone(user_tz)
-    except pytz.UnknownTimeZoneError:
-        tz = pytz.timezone(config.default_timezone)
-
-    current_time = datetime.now(tz).strftime("%d.%m.%Y %H:%M %Z")
-
-    prompt = REMINDER_PARSE_PROMPT.format(
-        current_time=current_time,
-        timezone=user_tz,
-        user_text=user_text,
-    )
-
-    try:
-        text, _ = await call_claude_isolated(client, config, model, prompt)
-        # Ищем JSON в ответе
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        if start == -1 or end == 0:
-            return None
-        return json.loads(text[start:end])
-    except Exception:
-        logger.exception("Ошибка парсинга напоминания")
-        return None

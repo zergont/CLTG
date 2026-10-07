@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS bot_settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
-INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('current_model', 'claude-haiku-4-5');
+INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('current_model', 'claude-haiku-5-5');
 
 -- Учёт использования (input/output раздельно)
 CREATE TABLE IF NOT EXISTS usage (

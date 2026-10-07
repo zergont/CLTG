@@ -3,34 +3,59 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Callable, Awaitable
+from typing import TYPE_CHECKING
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import anthropic
+from aiogram.exceptions import TelegramBadRequest
 
 from bot.utils import db
-from bot.config import calc_cost
-from bot.utils.anthropic.chat import summarize, process_message, call_claude_isolated
-from bot.utils.anthropic.models import context_limit
+from bot.utils.anthropic.chat import (
+    TurnUsage,
+    call_claude_isolated,
+    display_name,
+    process_message,
+    summarize,
+)
+from bot.utils.anthropic.models import ModelInfo
 from bot.utils.errors import user_error_message
-from bot.utils.html import markdown_to_html, split_long_message
+from bot.utils.html import TELEGRAM_MAX_LENGTH, markdown_to_html, split_long_message
 from bot.utils.prompts import TIMEZONE_DETECT_PROMPT
 
 if TYPE_CHECKING:
     from aiogram.types import Message
-    from aiogram import Bot
     from bot.config import Config
 
 logger = logging.getLogger(__name__)
 
 # Интервал обновления стримингового сообщения (секунды)
 STREAM_UPDATE_INTERVAL = 1.5
+# Длина куска ответа: запас под HTML-теги и экранирование до лимита Telegram
+TELEGRAM_SAFE_LENGTH = 3800
+
+# Временные сбои API: пользователю — понятное сообщение, в лог — WARNING без баг-репорта
+TRANSIENT_API_ERRORS = (
+    anthropic.RateLimitError,
+    anthropic.InternalServerError,
+    anthropic.APIConnectionError,  # включая APITimeoutError
+    asyncio.TimeoutError,
+)
+
+# Ссылки на фоновые задачи, чтобы их не собрал сборщик мусора
+_background_tasks: set[asyncio.Task] = set()
+
+
+def context_budget(config: "Config", model: ModelInfo) -> int:
+    """Рабочий бюджет контекста: меньше окна модели, чтобы диалог оставался дешёвым и быстрым."""
+    return min(config.context_budget_tokens, model.context_window)
 
 
 async def _try_detect_timezone(
     client: anthropic.AsyncAnthropic,
     config: "Config",
-    model: str,
+    model: ModelInfo,
     user_id: int,
     messages: list[dict],
 ) -> None:
@@ -52,10 +77,31 @@ async def _try_detect_timezone(
         data = json.loads(text[start:end])
         tz = data.get("timezone")
         if tz:
+            ZoneInfo(tz)  # проверяем, что такой пояс существует
             await db.update_timezone(user_id, tz)
             logger.debug("Определён часовой пояс %s для user_id=%d", tz, user_id)
+    except (ZoneInfoNotFoundError, ValueError):
+        logger.debug("Модель вернула неизвестный часовой пояс")
     except Exception:
         logger.debug("Не удалось определить часовой пояс", exc_info=True)
+
+
+async def _send_answer(placeholder: "Message", message: "Message", text: str) -> None:
+    """Отправляет готовый ответ: первая часть — в сообщение-заглушку, остальные — новыми.
+
+    Если HTML не прошёл (слишком длинный после разметки или Telegram не разобрал теги),
+    часть отправляется обычным текстом — ответ не теряется.
+    """
+    for i, part in enumerate(split_long_message(text, TELEGRAM_SAFE_LENGTH)):
+        send = placeholder.edit_text if i == 0 else message.answer
+        html = markdown_to_html(part)
+        try:
+            if len(html) > TELEGRAM_MAX_LENGTH:
+                raise ValueError("HTML длиннее лимита Telegram")
+            await send(html, parse_mode="HTML")
+        except (TelegramBadRequest, ValueError) as exc:
+            logger.warning("Ответ отправлен без разметки: %s", exc)
+            await send(part, parse_mode=None)
 
 
 async def handle_incoming(
@@ -63,7 +109,6 @@ async def handle_incoming(
     config: "Config",
     client: anthropic.AsyncAnthropic,
     content: list[dict] | str,
-    notify_admin: "Callable[[str], Awaitable[None]] | None" = None,
 ) -> None:
     """
     Универсальный обработчик входящего сообщения (текст / фото / документ).
@@ -77,8 +122,8 @@ async def handle_incoming(
     user_tz = user_row["timezone"] if user_row else config.default_timezone
     history = await db.get_history(chat_id)
 
-    # Получаем текущую модель
-    model = await db.get_setting("current_model") or config.model_haiku
+    # Текущая модель и уровень размышлений (выбирает администратор)
+    model, effort = await db.get_model_settings()
 
     # Проверяем триггер по времени (72ч тишины)
     last_msg_str = history.get("last_message_at")
@@ -94,28 +139,38 @@ async def handle_incoming(
     # Заглушка "печатает..."
     thinking_msg = await message.answer("⏳")
 
+    full_text = ""
+    usage: TurnUsage | None = None
+
     try:
         # Запускаем стриминг
         gen = process_message(
             client=client,
             config=config,
             model=model,
+            effort=effort,
             chat_id=chat_id,
             user_id=user_id,
             new_content=content,
             user_tz=user_tz,
             db_history=history,
+            user_name=display_name(
+                message.from_user.first_name,  # type: ignore[union-attr]
+                message.from_user.last_name,  # type: ignore[union-attr]
+                message.from_user.username,  # type: ignore[union-attr]
+            ),
         )
 
-        full_text = ""
-        usage: anthropic.Usage | None = None
-        last_edit = asyncio.get_event_loop().time()
+        last_edit = time.monotonic()
 
         async for chunk, chunk_usage in gen:
             if chunk:
                 full_text += chunk
-                now = asyncio.get_event_loop().time()
-                if now - last_edit >= STREAM_UPDATE_INTERVAL:
+                now = time.monotonic()
+                if (
+                    now - last_edit >= STREAM_UPDATE_INTERVAL
+                    and len(full_text) <= TELEGRAM_SAFE_LENGTH
+                ):
                     try:
                         await thinking_msg.edit_text(
                             markdown_to_html(full_text) + " ▌",
@@ -127,68 +182,43 @@ async def handle_incoming(
             if chunk_usage:
                 usage = chunk_usage
 
-        # Финальное обновление сообщения
-        if not full_text:
-            full_text = "_(пустой ответ)_"
-
-        parts = [markdown_to_html(part) for part in split_long_message(full_text)]
-        await thinking_msg.edit_text(parts[0], parse_mode="HTML")
-        for part in parts[1:]:
-            await message.answer(part, parse_mode="HTML")
-
     except Exception as exc:
-        logger.exception("Ошибка при обращении к Claude: %s", exc)
+        if isinstance(exc, TRANSIENT_API_ERRORS):
+            # Временный сбой API (SDK уже сделал повторы) — не баг, баг-репорт не нужен
+            logger.warning("Временная ошибка Claude API для chat_id=%d: %r", chat_id, exc)
+        else:
+            # ERROR уходит администратору баг-репортом (в т.ч. неверный ключ, 400, баги кода)
+            logger.exception("Ошибка при обработке сообщения chat_id=%d, user_id=%d", chat_id, user_id)
         await thinking_msg.edit_text(user_error_message(exc))
-        # Уведомляем администратора о неизвестных исключениях (ТЗ п.7.3)
-        is_known = isinstance(exc, (
-            anthropic.RateLimitError,
-            anthropic.InternalServerError,
-            anthropic.AuthenticationError,
-            anthropic.BadRequestError,
-            anthropic.APIConnectionError,
-            asyncio.TimeoutError,
-        ))
-        if not is_known and notify_admin:
-            try:
-                await notify_admin(
-                    f"🚨 Непредвиденная ошибка у chat_id={chat_id}: {type(exc).__name__}: {exc}"
-                )
-            except Exception:
-                pass
         return
 
-    # Сохраняем историю
+    if not full_text:
+        full_text = "_(пустой ответ)_"
+
+    # Сохраняем историю и расходы до отправки — ответ не потеряется при ошибке Telegram
     raw = history.get("messages_json") or "[]"
     live_history: list[dict] = json.loads(raw)
-    summary_text = history.get("summary")
-
-    # Добавляем новые пары
     live_history.append({"role": "user", "content": content})
     live_history.append({"role": "assistant", "content": full_text})
 
-    # Логируем usage
-    input_tokens = usage.input_tokens if usage else 0
-    output_tokens = usage.output_tokens if usage else 0
-    cache_write = (getattr(usage, "cache_creation_input_tokens", 0) or 0) if usage else 0
-    cache_read = (getattr(usage, "cache_read_input_tokens", 0) or 0) if usage else 0
-    cost = calc_cost(config, model, input_tokens, output_tokens, cache_write, cache_read)
-
     if usage:
         await db.log_usage(
-            chat_id, user_id, input_tokens, output_tokens, cost, model,
-            cache_write, cache_read,
+            chat_id, user_id, usage.input_tokens, usage.output_tokens, usage.cost, model.id,
+            usage.cache_write_tokens, usage.cache_read_tokens,
         )
 
-    # Обновляем общее приближение токенов
-    total_tokens = (history.get("total_tokens_approx") or 0) + input_tokens + output_tokens
+    # Реальный размер контекста последнего запроса (промпт + ответ)
+    total_tokens = usage.context_tokens if usage else (history.get("total_tokens_approx") or 0)
+    await db.save_history(chat_id=chat_id, messages=live_history, total_tokens=total_tokens)
+
+    try:
+        await _send_answer(thinking_msg, message, full_text)
+    except Exception:
+        logger.exception("Не удалось отправить ответ в chat_id=%d", chat_id)
 
     # Проверяем триггер по токенам
-    limit = context_limit(model)
-    token_threshold = int(limit * config.summary_trigger_tokens)
+    token_threshold = int(context_budget(config, model) * config.summary_trigger_tokens)
     token_summary_needed = total_tokens >= token_threshold
-
-    new_summary = None
-    summary_updated_at = None
 
     if timeout_summary_needed or token_summary_needed:
         trigger = "timeout" if timeout_summary_needed else "tokens"
@@ -196,35 +226,37 @@ async def handle_incoming(
             "Триггер саммаризации [%s] для chat_id=%d (токены: %d/%d)",
             trigger, chat_id, total_tokens, token_threshold,
         )
+        keep = config.summary_keep_last * 2  # пар → сообщений
+        to_summarize = live_history[:-keep] if len(live_history) > keep else live_history
+        kept_history = live_history[-keep:] if len(live_history) > keep else []
         try:
-            keep = config.summary_keep_last * 2  # пар → сообщений
-            to_summarize = live_history[:-keep] if len(live_history) > keep else live_history
-            live_history = live_history[-keep:] if len(live_history) > keep else []
-
             new_summary, _ = await summarize(
                 client=client,
                 config=config,
                 model=model,
                 messages_to_summarize=to_summarize,
-                prev_summary=summary_text,
+                prev_summary=history.get("summary"),
                 timeout_trigger=timeout_summary_needed,
             )
-            summary_updated_at = datetime.now(timezone.utc)
-            total_tokens = output_tokens  # сбрасываем счётчик
+            if not new_summary.strip():
+                raise RuntimeError("модель вернула пустое саммари")
+            # Историю обрезаем только после успешной саммаризации
+            live_history = kept_history
+            await db.save_history(
+                chat_id=chat_id,
+                messages=live_history,
+                total_tokens=0,  # точный размер станет известен на следующем запросе
+                summary=new_summary,
+                summary_updated_at=datetime.now(timezone.utc),
+            )
             logger.info("Саммаризация выполнена для chat_id=%d", chat_id)
         except Exception:
             logger.exception("Ошибка саммаризации для chat_id=%d", chat_id)
 
-    await db.save_history(
-        chat_id=chat_id,
-        messages=live_history,
-        total_tokens=total_tokens,
-        summary=new_summary,
-        summary_updated_at=summary_updated_at,
-    )
-
     # Фоновое определение часового пояса (раз в 10 сообщений)
     if len(live_history) % 10 == 0:
-        asyncio.create_task(
+        task = asyncio.create_task(
             _try_detect_timezone(client, config, model, user_id, live_history)
         )
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)

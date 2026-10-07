@@ -6,6 +6,14 @@ from datetime import datetime, timezone
 
 import aiosqlite
 
+from bot.utils.anthropic.models import (
+    DEFAULT_EFFORT,
+    EFFORT_LABELS,
+    LEGACY_MODELS,
+    ModelInfo,
+    get_model,
+)
+
 logger = logging.getLogger(__name__)
 
 DB_PATH = "cltg.db"
@@ -46,6 +54,17 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
     if added:
         await conn.commit()
         logger.info("Миграция: добавлены колонки cache_write_tokens, cache_read_tokens")
+
+    # bot_settings: устаревшие модели → актуальные (v1.2.0)
+    cursor = await conn.execute("SELECT value FROM bot_settings WHERE key = 'current_model'")
+    row = await cursor.fetchone()
+    if row and row[0] in LEGACY_MODELS:
+        await conn.execute(
+            "UPDATE bot_settings SET value = ? WHERE key = 'current_model'",
+            (LEGACY_MODELS[row[0]],),
+        )
+        await conn.commit()
+        logger.info("Миграция: модель %s заменена на %s", row[0], LEGACY_MODELS[row[0]])
 
 
 # ──────────────────────────────────────────
@@ -232,6 +251,22 @@ async def set_setting(key: str, value: str) -> None:
             (key, value),
         )
         await db.commit()
+
+
+async def get_current_model() -> ModelInfo:
+    return get_model(await get_setting("current_model"))
+
+
+async def get_effort(model_id: str) -> str:
+    """Уровень размышлений, выбранный для модели (хранится отдельно для каждой модели)."""
+    effort = await get_setting(f"effort:{model_id}")
+    return effort if effort in EFFORT_LABELS else DEFAULT_EFFORT
+
+
+async def get_model_settings() -> tuple[ModelInfo, str]:
+    """Текущая рабочая модель и её уровень размышлений."""
+    model = await get_current_model()
+    return model, await get_effort(model.id)
 
 
 # ──────────────────────────────────────────

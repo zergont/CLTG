@@ -21,7 +21,7 @@ USER_COMMANDS = [
 ]
 
 ADMIN_COMMANDS = USER_COMMANDS + [
-    BotCommand(command="model",   description="Сменить модель Claude"),
+    BotCommand(command="model",   description="Модель Claude и уровень размышлений"),
     BotCommand(command="ban",     description="Заблокировать: /ban <user_id>"),
     BotCommand(command="unban",   description="Разблокировать: /unban <user_id>"),
     BotCommand(command="users",   description="Список пользователей"),
@@ -36,7 +36,8 @@ def get_main_keyboard(is_admin: bool = False) -> ReplyKeyboardMarkup:
         [KeyboardButton(text="/reset"),      KeyboardButton(text="/reminders")],
     ]
     if is_admin:
-        rows.append([KeyboardButton(text="/users"), KeyboardButton(text="/usage")])
+        rows.append([KeyboardButton(text="/model"), KeyboardButton(text="/usage")])
+        rows.append([KeyboardButton(text="/users"), KeyboardButton(text="/context")])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 

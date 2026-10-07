@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -38,15 +38,8 @@ class Config:
     system_prompt: str
     default_timezone: str
 
-    # Цены
-    price_input_haiku: float
-    price_output_haiku: float
-    price_input_sonnet: float
-    price_output_sonnet: float
-    price_cache_write_multiplier: float
-    price_cache_read_multiplier: float
-
-    # Саммаризация
+    # Контекст и саммаризация
+    context_budget_tokens: int    # рабочий бюджет контекста (меньше окна модели)
     summary_trigger_tokens: float
     summary_trigger_hours: int
     summary_keep_last: int
@@ -64,14 +57,11 @@ class Config:
 
     # Отладка
     debug_mode: bool
+    bug_reports: bool   # отправлять ошибки из логов администратору
 
     # SearXNG
     searxng_url: str
     search_engine: str  # auto | searxng | native
-
-    # Модели (константы)
-    model_haiku: str = field(default="claude-haiku-4-5")
-    model_sonnet: str = field(default="claude-sonnet-4-6")
 
 
 def load_config() -> Config:
@@ -80,19 +70,14 @@ def load_config() -> Config:
         admin_id=int(_require("ADMIN_ID")),
         anthropic_api_key=_require("ANTHROPIC_API_KEY"),
         anthropic_timeout=int(os.getenv("ANTHROPIC_TIMEOUT_SECONDS", "540")),
-        anthropic_max_retries=int(os.getenv("ANTHROPIC_MAX_RETRIES", "0")),
+        anthropic_max_retries=int(os.getenv("ANTHROPIC_MAX_RETRIES", "3")),
         anthropic_concurrency=int(os.getenv("ANTHROPIC_GLOBAL_CONCURRENCY", "4")),
         system_prompt=os.getenv(
             "SYSTEM_PROMPT",
             "Ты полезный ассистент. Текущее время передаётся в каждом сообщении.",
         ),
         default_timezone=os.getenv("DEFAULT_TIMEZONE", "Europe/Moscow"),
-        price_input_haiku=float(os.getenv("ANTHROPIC_PRICE_INPUT", "0.000001")),
-        price_output_haiku=float(os.getenv("ANTHROPIC_PRICE_OUTPUT", "0.000005")),
-        price_input_sonnet=float(os.getenv("ANTHROPIC_PRICE_INPUT_SONNET", "0.000003")),
-        price_output_sonnet=float(os.getenv("ANTHROPIC_PRICE_OUTPUT_SONNET", "0.000015")),
-        price_cache_write_multiplier=float(os.getenv("ANTHROPIC_PRICE_CACHE_WRITE_MULTIPLIER", "1.25")),
-        price_cache_read_multiplier=float(os.getenv("ANTHROPIC_PRICE_CACHE_READ_MULTIPLIER", "0.10")),
+        context_budget_tokens=int(os.getenv("CONTEXT_BUDGET_TOKENS", "100000")),
         summary_trigger_tokens=float(os.getenv("SUMMARY_TRIGGER_TOKENS", "0.85")),
         summary_trigger_hours=int(os.getenv("SUMMARY_TRIGGER_HOURS", "72")),
         summary_keep_last=int(os.getenv("SUMMARY_KEEP_LAST", "10")),
@@ -104,28 +89,7 @@ def load_config() -> Config:
         reminder_jitter=_parse_duration_seconds(os.getenv("REMINDER_JITTER", "2s")),
         reminder_default_silent=bool(int(os.getenv("REMINDER_DEFAULT_SILENT", "1"))),
         debug_mode=bool(int(os.getenv("DEBUG_MODE", "0"))),
+        bug_reports=bool(int(os.getenv("BUG_REPORTS", "1"))),
         searxng_url=os.getenv("SEARXNG_URL", "http://localhost:8888"),
-        search_engine=os.getenv("SEARCH_ENGINE", "auto"),
+        search_engine=os.getenv("SEARCH_ENGINE", "searxng"),
     )
-
-
-def calc_cost(
-    config: Config,
-    model: str,
-    input_tokens: int,
-    output_tokens: int,
-    cache_write_tokens: int = 0,
-    cache_read_tokens: int = 0,
-) -> float:
-    """Рассчитывает стоимость запроса с учётом кэш-токенов."""
-    if "sonnet" in model:
-        price_in = config.price_input_sonnet
-        price_out = config.price_output_sonnet
-    else:
-        price_in = config.price_input_haiku
-        price_out = config.price_output_haiku
-
-    cost = input_tokens * price_in + output_tokens * price_out
-    cost += cache_write_tokens * price_in * config.price_cache_write_multiplier
-    cost += cache_read_tokens * price_in * config.price_cache_read_multiplier
-    return cost

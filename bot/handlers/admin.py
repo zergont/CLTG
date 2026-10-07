@@ -6,11 +6,13 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from aiogram import Router, F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
+from bot.handlers._common import context_budget
 from bot.utils import db
-from bot.utils.anthropic.models import context_limit, MODEL_LABELS, AVAILABLE_MODELS
+from bot.utils.anthropic.models import EFFORT_LABELS, MODELS, ModelInfo
 from bot.utils.html import split_long_message
 
 if TYPE_CHECKING:
@@ -24,29 +26,53 @@ def _admin_filter(message: Message, config: "Config") -> bool:
     return message.from_user is not None and message.from_user.id == config.admin_id
 
 
+# ──────────────────────────────────────────
+# /model — рабочая модель и уровень размышлений (только администратор)
+# ──────────────────────────────────────────
+
+def _model_text(model: ModelInfo, effort: str) -> str:
+    return (
+        "🤖 <b>Настройки модели</b> (общие для всех чатов)\n\n"
+        f"Модель: <b>{model.label}</b>\n"
+        f"Размышления: <b>{EFFORT_LABELS[effort]}</b>\n\n"
+        "<i>Чем выше уровень размышлений, тем вдумчивее ответы, "
+        "но они дольше и дороже. Уровень запоминается для каждой модели.</i>"
+    )
+
+
+def _model_keyboard(model: ModelInfo, effort: str) -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(
+            text=f"{m.label}{' ✅' if m.id == model.id else ''}",
+            callback_data=f"model:set:{m.id}",
+        )]
+        for m in MODELS.values()
+    ]
+
+    effort_buttons = [
+        InlineKeyboardButton(
+            text=f"🧠 {label}{' ✅' if level == effort else ''}",
+            callback_data=f"model:effort:{level}",
+        )
+        for level, label in EFFORT_LABELS.items()
+    ]
+    buttons.append(effort_buttons[:3])
+    buttons.append(effort_buttons[3:])
+
+    buttons.append([InlineKeyboardButton(text="✖ Закрыть", callback_data="model:close")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
 @router.message(Command("model"))
 async def cmd_model(message: Message, config: "Config", **kwargs) -> None:
     if not _admin_filter(message, config):
         return
-    current = await db.get_setting("current_model") or config.model_haiku
+    model, effort = await db.get_model_settings()
     await message.answer(
-        "🤖 <b>Выбор модели Claude:</b>",
+        _model_text(model, effort),
         parse_mode="HTML",
-        reply_markup=_model_keyboard(current),
+        reply_markup=_model_keyboard(model, effort),
     )
-
-
-def _model_keyboard(current: str) -> InlineKeyboardMarkup:
-    buttons = []
-    for m in AVAILABLE_MODELS:
-        label = MODEL_LABELS.get(m, m)
-        mark = " ✅" if m == current else ""
-        buttons.append([InlineKeyboardButton(
-            text=f"{label}{mark}",
-            callback_data=f"model:{m}",
-        )])
-    buttons.append([InlineKeyboardButton(text="✖ Отмена", callback_data="model:cancel")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 @router.callback_query(F.data.startswith("model:"))
@@ -55,30 +81,47 @@ async def cb_model(callback: CallbackQuery, config: "Config", **kwargs) -> None:
         await callback.answer("Нет доступа.", show_alert=True)
         return
 
-    action = callback.data.split(":", 1)[1]  # type: ignore[union-attr]
+    _, action, *rest = callback.data.split(":")  # type: ignore[union-attr]
+    value = rest[0] if rest else ""
 
-    if action == "cancel":
+    if action in ("close", "cancel"):
         await callback.message.delete()  # type: ignore[union-attr]
         await callback.answer()
         return
 
-    await db.set_setting("current_model", action)
-    label = MODEL_LABELS.get(action, action)
-    await callback.message.edit_text(  # type: ignore[union-attr]
-        f"✅ Модель переключена на <b>{label}</b>",
-        parse_mode="HTML",
-    )
-    await callback.answer()
+    if action == "set" and value in MODELS:
+        await db.set_setting("current_model", value)
+        notice = f"Модель: {MODELS[value].label}"
+    elif action == "effort" and value in EFFORT_LABELS:
+        model = await db.get_current_model()
+        await db.set_setting(f"effort:{model.id}", value)
+        notice = f"Размышления: {EFFORT_LABELS[value]}"
+    else:
+        # Кнопка из старого меню или неизвестное значение
+        await callback.answer("Меню устарело, откройте /model заново.", show_alert=True)
+        return
+
+    model, effort = await db.get_model_settings()
+    try:
+        await callback.message.edit_text(  # type: ignore[union-attr]
+            _model_text(model, effort),
+            parse_mode="HTML",
+            reply_markup=_model_keyboard(model, effort),
+        )
+    except TelegramBadRequest:
+        pass  # нажали уже выбранный вариант — сообщение не изменилось
+    await callback.answer(f"✅ {notice}")
 
 
-@router.message(lambda m: m.text and m.text.strip() in AVAILABLE_MODELS)
+@router.message(lambda m: m.text and m.text.strip() in MODELS)
 async def cmd_model_set(message: Message, config: "Config", **kwargs) -> None:
     if not _admin_filter(message, config):
         return
     new_model = message.text.strip()  # type: ignore[union-attr]
     await db.set_setting("current_model", new_model)
-    label = MODEL_LABELS.get(new_model, new_model)
-    await message.answer(f"✅ Модель переключена на <b>{label}</b>", parse_mode="HTML")
+    await message.answer(
+        f"✅ Модель переключена на <b>{MODELS[new_model].label}</b>", parse_mode="HTML"
+    )
 
 
 @router.message(Command("ban"))
@@ -180,8 +223,8 @@ async def cmd_context(message: Message, config: "Config", **kwargs) -> None:
     if not _admin_filter(message, config):
         return
 
-    current_model = await db.get_setting("current_model") or config.model_haiku
-    limit = context_limit(current_model)
+    current_model = await db.get_current_model()
+    limit = context_budget(config, current_model)
 
     rows = await db.get_all_users()
     if not rows:
@@ -189,8 +232,8 @@ async def cmd_context(message: Message, config: "Config", **kwargs) -> None:
         return
 
     lines = [
-        f"📊 <b>Контекстные окна</b> (модель: <code>{current_model}</code>, "
-        f"лимит: {limit:,} токенов)\n"
+        f"📊 <b>Контекстные окна</b> (модель: <code>{current_model.id}</code>, "
+        f"бюджет: {limit:,} токенов, саммари с {config.summary_trigger_tokens:.0%})\n"
     ]
 
     for r in rows:

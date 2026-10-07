@@ -7,11 +7,13 @@ import anthropic
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.types import ErrorEvent
 
 from bot.config import load_config
 from bot.keyboards import setup_commands
 from bot.middlewares import RegisterUserMiddleware
 from bot.utils import db
+from bot.utils.bug_report import setup_bug_reports
 from bot.utils.errors import handle_telegram_error
 from bot.utils.log import setup_logging
 from bot.utils.reminders import run_scheduler
@@ -51,12 +53,27 @@ async def main() -> None:
 
     dp = Dispatcher()
 
-    # Функция уведомления администратора
-    async def notify_admin(text: str) -> None:
-        try:
-            await bot.send_message(config.admin_id, text)
-        except Exception:
-            logger.exception("Не удалось уведомить администратора")
+    # Баг-репорты: все ошибки уровня ERROR из логов уходят администратору
+    if config.bug_reports:
+        setup_bug_reports(bot, config.admin_id)
+
+    @dp.errors()
+    async def on_unhandled_error(event: ErrorEvent) -> bool:
+        """Необработанное исключение в хендлере — в лог (и баг-репорт) с контекстом."""
+        update = event.update
+        source = update.message or (update.callback_query and update.callback_query.message)
+        user = (update.message and update.message.from_user) or (
+            update.callback_query and update.callback_query.from_user
+        )
+        logger.error(
+            "Необработанная ошибка в обработчике: update_id=%s, chat_id=%s, user_id=%s, тип=%s",
+            update.update_id,
+            source.chat.id if source else None,
+            user.id if user else None,
+            update.event_type,
+            exc_info=event.exception,
+        )
+        return True
 
     # Middleware
     dp.message.middleware(RegisterUserMiddleware())
@@ -64,7 +81,6 @@ async def main() -> None:
     # Данные для инъекции в хендлеры
     dp["config"] = config
     dp["client"] = client
-    dp["notify_admin"] = notify_admin
 
     # Роутеры (порядок важен: admin и photo/document — до общего text)
     dp.include_router(admin_handler.router)

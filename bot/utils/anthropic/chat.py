@@ -3,21 +3,44 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
+from dataclasses import dataclass
 from datetime import datetime, timezone as dt_timezone
-from typing import AsyncGenerator
+from typing import Any, AsyncGenerator
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import aiosqlite
 import anthropic
-import httpx
-import pytz
+import httpx2
 
 from bot.config import Config
-from bot.utils.errors import with_anthropic_retry
+from bot.utils.anthropic.models import MODELS, SERVICE_EFFORT, ModelInfo, calc_cost
 
 logger = logging.getLogger(__name__)
 
-# Флаг доступности SearXNG, устанавливается при старте через init_searxng()
+# Режим поиска (auto | searxng | native) и доступность SearXNG — задаются init_searxng()
+_search_engine: str = "searxng"
+_searxng_url: str = ""
 _searxng_available: bool = False
+_searxng_checked_at: float = 0.0
+# В режиме auto недоступный SearXNG перепроверяется не чаще раза в N секунд
+SEARXNG_RECHECK_SECONDS = 300
+
+# Лимит на один ответ (включая размышления); стриминг снимает риск HTTP-таймаута
+MAX_TOKENS = 64_000
+# Лимит для изолированных (не стриминговых) вызовов
+ISOLATED_MAX_TOKENS = 16_000
+# Максимум итераций agentic loop (вызовы инструментов)
+MAX_TOOL_ITERATIONS = 5
+
+# Серверный fallback при отказе модели: запрос повторяется на рекомендованной модели
+SERVER_FALLBACK_BETA = "server-side-fallback-2026-07-01"
+
+# Заголовок служебного блока, который бот добавляет к каждому сообщению пользователя
+TURN_CONTEXT_HEADER = "[Служебная информация от бота, не от пользователя]"
+
+REFUSAL_TEXT ="⚠️ Модель отказалась отвечать на этот запрос. Попробуйте переформулировать."
+MAX_TOKENS_TEXT = "✂️ Ответ обрезан: достигнут лимит длины."
 
 # Custom tool — через SearXNG
 WEB_SEARCH_TOOL: dict = {
@@ -39,25 +62,18 @@ WEB_SEARCH_TOOL: dict = {
     },
 }
 
-
-# Нативный tool Anthropic — fallback если SearXNG недоступен
-NATIVE_WEB_SEARCH_TOOL: dict = {
-    "type": "web_search_20250305",
-    "name": "web_search",
-}
-
 REMINDER_TOOL: dict = {
     "name": "create_reminder",
     "description": (
         "Создаёт напоминание для пользователя. Используй всегда когда пользователь "
         "просит что-то напомнить, поставить будильник или создать повторяющееся уведомление. "
-        "Время due_at рассчитывай в UTC относительно текущего времени из системного промпта."
+        "Время due_at рассчитывай в UTC относительно текущего времени из служебного блока в сообщении пользователя."
     ),
     "input_schema": {
         "type": "object",
         "properties": {
             "text": {"type": "string", "description": "Текст напоминания"},
-            "due_at": {"type": "string", "description": "Время срабатывания ISO 8601 UTC. Конвертируй из часового пояса пользователя используя смещение из системного промпта. Пример: если сейчас 14:30 UTC+03:00 и нужно через 30 мин → 2026-03-12T12:00:00Z"},
+            "due_at": {"type": "string", "description": "Время срабатывания ISO 8601 UTC. Конвертируй из часового пояса пользователя используя смещение из служебного блока «Текущее время». Пример: если сейчас 14:30 UTC+03:00 и нужно через 30 мин → 2026-03-12T12:00:00Z"},
             "is_chain": {"type": "boolean", "description": "true если повторяющееся"},
             "interval_seconds": {"type": "integer", "description": "Интервал повтора в секундах"},
             "steps_left": {"type": "integer", "description": "Макс. число срабатываний (без поля = бессрочно)"},
@@ -67,6 +83,53 @@ REMINDER_TOOL: dict = {
         "required": ["text", "due_at"],
     },
 }
+
+
+def _native_web_search_tool(model: ModelInfo) -> dict:
+    """Нативный web_search Anthropic (платный: $0.01 за запрос + токены результатов)."""
+    return {"type": model.web_search_tool, "name": "web_search"}
+
+
+async def _search_tool(model: ModelInfo) -> dict:
+    """Инструмент поиска для запроса с учётом режима SEARCH_ENGINE.
+
+    searxng — всегда бесплатный SearXNG (если он лежит, модель получит «поиск недоступен»);
+    native  — всегда платный нативный поиск;
+    auto    — SearXNG, а платный только пока SearXNG недоступен (с периодической перепроверкой).
+    """
+    if _search_engine == "native":
+        return _native_web_search_tool(model)
+    if _search_engine == "auto" and not _searxng_available:
+        if time.monotonic() - _searxng_checked_at >= SEARXNG_RECHECK_SECONDS:
+            await _check_searxng()
+        if not _searxng_available:
+            return _native_web_search_tool(model)
+    return WEB_SEARCH_TOOL
+
+
+@dataclass
+class TurnUsage:
+    """Суммарный usage всех вызовов API за один ход диалога."""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_write_tokens: int = 0
+    cache_read_tokens: int = 0
+    cost: float = 0.0
+    # Размер контекста последнего вызова (весь промпт + ответ) — для триггера саммаризации
+    context_tokens: int = 0
+
+    def add(self, model: ModelInfo, message: Any) -> None:
+        usage = message.usage
+        cache_write = usage.cache_creation_input_tokens or 0
+        cache_read = usage.cache_read_input_tokens or 0
+        self.input_tokens += usage.input_tokens
+        self.output_tokens += usage.output_tokens
+        self.cache_write_tokens += cache_write
+        self.cache_read_tokens += cache_read
+        # После серверного fallback ответ мог дать другая модель — считаем по её ценам, если знаем их
+        self.cost += calc_cost(MODELS.get(getattr(message, "model", None), model), usage)
+        self.context_tokens = usage.input_tokens + cache_write + cache_read + usage.output_tokens
 
 
 async def _execute_reminder_tool(
@@ -127,45 +190,53 @@ async def _execute_reminder_tool(
         return f"Ошибка создания напоминания: {exc}"
 
 
-async def init_searxng(url: str, engine: str = "auto") -> bool:
-    """Проверяет доступность SearXNG. Вызывается один раз при старте бота.
-
-    engine: auto | searxng | native
-    """
-    global _searxng_available
-
-    if engine == "native":
-        _searxng_available = False
-        logger.info("🔍 Поисковый движок: нативный Anthropic web_search")
-        return False
-
+async def _check_searxng() -> bool:
+    """Проверяет доступность SearXNG и запоминает результат."""
+    global _searxng_available, _searxng_checked_at
+    was_available = _searxng_available
+    _searxng_checked_at = time.monotonic()
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with httpx2.AsyncClient(timeout=3.0) as client:
             r = await client.get(
-                f"{url}/search",
+                f"{_searxng_url}/search",
                 params={"q": "test", "format": "json"},
             )
             r.raise_for_status()
         _searxng_available = True
-        logger.info("✅ Поисковый движок: SearXNG (%s)", url)
-        return True
+        if not was_available:
+            logger.info("✅ Поисковый движок: SearXNG (%s)", _searxng_url)
     except Exception as exc:
         _searxng_available = False
-        if engine == "searxng":
+        if _search_engine == "auto":
             logger.warning(
-                "⚠️  SearXNG недоступен (%s). Веб-поиск отключён.", exc
+                "⚠️  SearXNG недоступен (%s). Временно платный нативный web_search.", exc
             )
-        else:  # auto
+        else:
             logger.warning(
-                "⚠️  SearXNG недоступен (%s). Fallback: нативный Anthropic web_search.", exc
+                "⚠️  SearXNG недоступен (%s). Поиск не работает, пока SearXNG не поднимется.", exc
             )
+    return _searxng_available
+
+
+async def init_searxng(url: str, engine: str = "searxng") -> bool:
+    """Задаёт режим поиска и проверяет SearXNG. Вызывается при старте бота.
+
+    engine: searxng (только бесплатный SearXNG) | auto (SearXNG, при сбое — платный) | native
+    """
+    global _search_engine, _searxng_url
+    _search_engine = engine if engine in ("auto", "searxng", "native") else "searxng"
+    _searxng_url = url
+
+    if _search_engine == "native":
+        logger.info("🔍 Поисковый движок: нативный Anthropic web_search (платный)")
         return False
+    return await _check_searxng()
 
 
 async def _searxng_search(query: str, searxng_url: str, max_results: int = 5) -> str:
     """HTTP-запрос к SearXNG, возвращает текст с результатами."""
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx2.AsyncClient(timeout=10.0) as client:
             r = await client.get(
                 f"{searxng_url}/search",
                 params={"q": query, "format": "json", "categories": "general"},
@@ -187,26 +258,13 @@ async def _searxng_search(query: str, searxng_url: str, max_results: int = 5) ->
         return f"Поиск временно недоступен: {exc}"
 
 
-def _build_system_prompt(config: Config, user_tz: str) -> list[dict]:
-    """Возвращает system-блоки для Claude API с кэшированием статической части.
+def _build_system_prompt(config: Config) -> list[dict]:
+    """Статический system-блок с кэшированием.
 
-    Структура:
-      [0] статический блок (промпт + инструменты) — с cache_control
-      [1] динамический блок (текущее время) — без cache_control
+    Текущее время сюда не входит: system стоит в начале промпта, и любое его
+    изменение сбрасывает кэш всей истории. Время передаётся отдельным
+    служебным блоком в конце нового сообщения (см. _turn_context).
     """
-    try:
-        tz = pytz.timezone(user_tz)
-    except pytz.UnknownTimeZoneError:
-        tz = pytz.timezone(config.default_timezone)
-    now_dt = datetime.now(tz)
-    raw_offset = now_dt.strftime("%z")  # e.g. +0300 or -0530
-    if raw_offset:
-        utc_offset = f"UTC{raw_offset[:3]}:{raw_offset[3:]}"  # UTC+03:00
-    else:
-        utc_offset = "UTC"
-    now = now_dt.strftime(f"%d.%m.%Y %H:%M %Z ({utc_offset})")
-
-    # --- статическая часть (кэшируется) ---
     capabilities = (
         "\n\n## Твои инструменты и возможности\n\n"
         "### 🔍 web_search\n"
@@ -234,7 +292,7 @@ def _build_system_prompt(config: Config, user_tz: str) -> list[dict]:
         "- Таймеры: «через 2 часа напомни выключить духовку»\n\n"
         "**Расчёт времени (ВАЖНО):**\n"
         "Параметр `due_at` всегда в UTC. Ты обязан конвертировать локальное время пользователя "
-        "в UTC, используя смещение из строки «Текущее время» ниже.\n\n"
+        "в UTC, используя смещение из служебного блока «Текущее время».\n\n"
         "Примеры конвертации (при UTC+03:00):\n"
         "- «в 9 утра» → ближайшие 09:00 локально → минус 3 часа → 06:00Z\n"
         "- «через 2 часа» → текущее UTC + 2 часа\n"
@@ -247,35 +305,72 @@ def _build_system_prompt(config: Config, user_tz: str) -> list[dict]:
         "### 🧠 Память и контекст\n"
         "Ты ведёшь непрерывный диалог с пользователем. Между сессиями сохраняется "
         "структурированное саммари предыдущих разговоров. Запоминай и используй:\n"
-        "- **Имя** — обращайся по имени, если пользователь представился\n"
+        "- **Имя** — имя собеседника из профиля Telegram приходит в служебном блоке "
+        "(строка «Собеседник»).Обращайся по имени тепло и естественно, но не в каждой реплике. "
+        "Если человек представился иначе или попросил называть его по-другому — используй это имя\n"
         "- **Часовой пояс** — определяется автоматически и указан в «Текущем времени»\n"
         "- **Ключевые факты** — профессия, локация, предпочтения, проекты над которыми работает\n"
         "- **Незавершённые задачи** — если в саммари есть открытые вопросы, можешь напомнить о них\n"
         "- **Стиль общения** — подстраивайся под формальность/неформальность пользователя\n\n"
         "### 🕐 Текущее время\n"
-        "В каждом запросе указано текущее время пользователя с часовым поясом "
-        "и UTC-смещением. Используй его для:\n"
+        "В конце каждого сообщения пользователя бот добавляет служебный блок "
+        "«[Служебная информация от бота, не от пользователя]» с именем собеседника и текущим "
+        "временем (часовой пояс и UTC-смещение пользователя). Его пишет бот, а не человек: "
+        "не цитируй и не упоминай его. Время используй для:\n"
         "- Расчёта `due_at` в напоминаниях (конвертация в UTC)\n"
         "- Понимания относительных выражений («сегодня», «завтра», «через час», «в эту пятницу»)\n"
         "- Ответов на прямые вопросы о времени и дате\n"
         "- Определения уместности приветствия (утро/день/вечер)\n"
     )
-    static_text = config.system_prompt + capabilities
-
-    # --- динамическая часть (не кэшируется) ---
-    dynamic_text = f"Текущее время: {now}"
-
     return [
         {
             "type": "text",
-            "text": static_text,
+            "text": config.system_prompt + capabilities,
             "cache_control": {"type": "ephemeral"},
         },
-        {
-            "type": "text",
-            "text": dynamic_text,
-        },
     ]
+
+
+def _user_zone(config: Config, user_tz: str) -> ZoneInfo:
+    try:
+        return ZoneInfo(user_tz)
+    except (ZoneInfoNotFoundError, ValueError):
+        return ZoneInfo(config.default_timezone)
+
+
+def display_name(
+    first_name: str | None,
+    last_name: str | None = None,
+    username: str | None = None,
+) -> str | None:
+    """Имя собеседника из профиля Telegram: «Имя Фамилия (@username)»."""
+    name = " ".join(p.strip() for p in (first_name, last_name) if p and p.strip())
+    if username:
+        name = f"{name} (@{username})" if name else f"@{username}"
+    return name[:100] or None
+
+
+def _turn_context(config: Config, user_tz: str, user_name: str | None = None) -> str:
+    """Служебный блок с именем собеседника и его текущим временем.
+
+    Добавляется в конец нового сообщения пользователя: время меняется каждую минуту,
+    а в группе от сообщения к сообщению меняется и собеседник — в кэшируемый префикс
+    это не кладём. (Отдельное role="system" сообщение API принимает, но в проверке
+    на Haiku 5.5 модель его содержимое не использовала — поэтому текстовый блок.)
+    """
+    now_dt = datetime.now(_user_zone(config, user_tz))
+    raw_offset = now_dt.strftime("%z")  # e.g. +0300 or -0530
+    if raw_offset:
+        utc_offset = f"UTC{raw_offset[:3]}:{raw_offset[3:]}"  # UTC+03:00
+    else:
+        utc_offset = "UTC"
+    now = now_dt.strftime(f"%d.%m.%Y %H:%M %Z ({utc_offset})")
+
+    lines = [TURN_CONTEXT_HEADER]
+    if user_name:
+        lines.append(f"Собеседник: {user_name}")
+    lines.append(f"Текущее время: {now}")
+    return "\n".join(lines)
 
 
 def _strip_images_from_history(messages: list[dict]) -> list[dict]:
@@ -304,6 +399,7 @@ def _build_messages(
     live_history: list[dict],
     summary: str | None,
     new_content: list[dict] | str,
+    turn_context: str,
 ) -> list[dict]:
     """Формирует итоговый массив messages[] для API с маркерами кэширования.
 
@@ -312,7 +408,7 @@ def _build_messages(
       [assistant: Понял]                  — если есть
       [... live_history[:-1] ...]
       [последний элемент истории + cache_control на последнем блоке]
-      [user: new_content]                 — БЕЗ cache_control
+      [user: new_content + собеседник/время] — БЕЗ cache_control: время меняется каждую минуту
     """
     messages: list[dict] = []
 
@@ -363,20 +459,80 @@ def _build_messages(
 
         messages.append({"role": last["role"], "content": cached_content})
 
-    # --- новое сообщение — без кэша ---
-    messages.append({"role": "user", "content": new_content})  # type: ignore[arg-type]
+    # --- новое сообщение + собеседник и текущее время — без кэша ---
+    if isinstance(new_content, str):
+        user_blocks: list[dict] = [{"type": "text", "text": new_content}]
+    else:
+        user_blocks = list(new_content)
+    user_blocks.append({"type": "text", "text": turn_context})
+    messages.append({"role": "user", "content": user_blocks})
     return messages
+
+
+def _request_params(
+    model: ModelInfo,
+    effort: str,
+    max_tokens: int,
+    **params: Any,
+) -> dict:
+    """Общие параметры запроса: адаптивные размышления + уровень effort."""
+    return {
+        "model": model.id,
+        "max_tokens": max_tokens,
+        "thinking": {"type": "adaptive"},
+        "output_config": {"effort": effort},
+        **params,
+    }
+
+
+def _open_stream(client: anthropic.AsyncAnthropic, model: ModelInfo, params: dict):
+    """Открывает стрим; для Sonnet/Opus включает серверный fallback при отказе."""
+    if model.server_fallback:
+        return client.beta.messages.stream(
+            **params,
+            betas=[SERVER_FALLBACK_BETA],
+            fallbacks="default",
+        )
+    return client.messages.stream(**params)
+
+
+def _echo_content(content: list[Any]) -> list[Any]:
+    """Готовит content ответа к возврату в следующий запрос agentic loop.
+
+    Если посреди ответа сработал fallback, блоки до последней точки переключения
+    (размышления и незавершённые вызовы инструментов отказавшей модели) возвращать
+    нельзя — оставляем из них только текст и завершённые серверные поиски.
+    """
+    boundary = max(
+        (i for i, block in enumerate(content) if block.type == "fallback"),
+        default=-1,
+    )
+    if boundary < 0:
+        return content
+
+    head = content[:boundary]
+    result_ids = {
+        block.tool_use_id for block in head if getattr(block, "tool_use_id", None)
+    }
+    kept = [
+        block for block in head
+        if block.type == "text"
+        or (block.type == "server_tool_use" and block.id in result_ids)
+        or block.type.endswith("_tool_result")
+    ]
+    return kept + content[boundary + 1:]
 
 
 async def stream_response(
     client: anthropic.AsyncAnthropic,
     config: Config,
-    model: str,
+    model: ModelInfo,
+    effort: str,
     messages: list[dict],
     system: list[dict],
     chat_id: int = 0,
     user_id: int = 0,
-) -> AsyncGenerator[tuple[str, anthropic.Usage | None], None]:
+) -> AsyncGenerator[tuple[str, TurnUsage | None], None]:
     """Async generator: стриминг ответа Claude.
 
     Поддерживает agentic loop: обрабатывает tool_use блоки (web_search, create_reminder).
@@ -385,43 +541,53 @@ async def stream_response(
     Yields (chunk_text, None) для каждого текстового чанка.
     Финальный yield: ("", usage) с суммарным usage всех вызовов.
     """
-    total_input = 0
-    total_output = 0
-    total_cache_write = 0
-    total_cache_read = 0
+    usage = TurnUsage()
     current_messages = list(messages)
+    has_text = False
 
-    active_tools: list[dict] = (
-        [WEB_SEARCH_TOOL, REMINDER_TOOL]
-        if _searxng_available
-        else [NATIVE_WEB_SEARCH_TOOL, REMINDER_TOOL]  # type: ignore[list-item]
-    )
+    active_tools: list[dict] = [await _search_tool(model), REMINDER_TOOL]
 
-    for _iteration in range(5):  # максимум 5 итераций
-        msgs = current_messages
+    for _iteration in range(MAX_TOOL_ITERATIONS):
+        params = _request_params(
+            model, effort, MAX_TOKENS,
+            system=system, messages=current_messages, tools=active_tools,
+        )
+        # Текст до и после вызова инструмента разделяем пустой строкой
+        separator_pending = has_text
 
-        async def _open_stream(m=msgs):
-            return client.messages.stream(
-                model=model,
-                max_tokens=8192,
-                system=system,
-                messages=m,
-                tools=active_tools,  # type: ignore[arg-type]
-            )
-
-        stream_cm = await with_anthropic_retry(_open_stream, config)
-        async with stream_cm as stream:
+        async with _open_stream(client, model, params) as stream:
             async for text_chunk in stream.text_stream:
+                if separator_pending:
+                    yield "\n\n", None
+                    separator_pending = False
+                has_text = True
                 yield text_chunk, None
             final_msg = await stream.get_final_message()
 
-        if final_msg and final_msg.usage:
-            total_input += final_msg.usage.input_tokens
-            total_output += final_msg.usage.output_tokens
-            total_cache_write += getattr(final_msg.usage, "cache_creation_input_tokens", 0) or 0
-            total_cache_read += getattr(final_msg.usage, "cache_read_input_tokens", 0) or 0
+        usage.add(model, final_msg)
+        stop_reason = final_msg.stop_reason
 
-        if not final_msg or final_msg.stop_reason != "tool_use":
+        if stop_reason == "refusal":
+            details = getattr(final_msg, "stop_details", None)
+            logger.warning(
+                "Отказ модели %s для chat_id=%d (категория: %s)",
+                final_msg.model, chat_id, getattr(details, "category", None),
+            )
+            yield ("\n\n" if has_text else "") + REFUSAL_TEXT, None
+            break
+
+        if stop_reason == "max_tokens":
+            yield ("\n\n" if has_text else "") + MAX_TOKENS_TEXT, None
+            break
+
+        if stop_reason == "pause_turn":
+            # Серверный инструмент (нативный web_search) взял паузу — продолжаем тот же ход
+            current_messages = current_messages + [
+                {"role": "assistant", "content": _echo_content(final_msg.content)},
+            ]
+            continue
+
+        if stop_reason != "tool_use":
             break
 
         tool_blocks = [b for b in final_msg.content if b.type == "tool_use"]
@@ -468,39 +634,38 @@ async def stream_response(
             )
 
         current_messages = current_messages + [
-            {"role": "assistant", "content": final_msg.content},
+            {"role": "assistant", "content": _echo_content(final_msg.content)},
             {"role": "user", "content": tool_results},
         ]
 
-    yield "", anthropic.types.Usage(
-        input_tokens=total_input,
-        output_tokens=total_output,
-        cache_creation_input_tokens=total_cache_write,
-        cache_read_input_tokens=total_cache_read,
-    )
+    yield "", usage
 
 
 async def call_claude_isolated(
     client: anthropic.AsyncAnthropic,
     config: Config,
-    model: str,
+    model: ModelInfo,
     prompt: str,
+    effort: str = SERVICE_EFFORT,
     system: str | None = None,
-) -> tuple[str, anthropic.Usage]:
+) -> tuple[str, TurnUsage]:
     """Изолированный вызов Claude без истории. Возвращает (text, usage)."""
-    sys_prompt = system or config.system_prompt
-
-    async def _call():
-        return await client.messages.create(
-            model=model,
-            max_tokens=4096,
-            system=sys_prompt,
+    response = await client.messages.create(
+        **_request_params(
+            model, effort, ISOLATED_MAX_TOKENS,
+            system=system or config.system_prompt,
             messages=[{"role": "user", "content": prompt}],
         )
+    )
+    usage = TurnUsage()
+    usage.add(model, response)
 
-    response = await with_anthropic_retry(_call, config)
-    text = response.content[0].text if response.content else ""
-    return text, response.usage
+    if response.stop_reason == "refusal":
+        raise RuntimeError(f"Модель {response.model} отказалась отвечать (refusal)")
+
+    # Ответ может начинаться с блоков размышлений — берём только текст
+    text = "".join(b.text for b in response.content if b.type == "text")
+    return text, usage
 
 
 SUMMARY_PROMPT_TEMPLATE = (
@@ -547,11 +712,11 @@ def _format_dialogue(messages: list[dict]) -> str:
 async def summarize(
     client: anthropic.AsyncAnthropic,
     config: Config,
-    model: str,
+    model: ModelInfo,
     messages_to_summarize: list[dict],
     prev_summary: str | None,
     timeout_trigger: bool = False,
-) -> tuple[str, anthropic.Usage]:
+) -> tuple[str, TurnUsage]:
     """Создаёт новое саммари, объединяя со старым."""
     template = SUMMARY_PROMPT_TIMEOUT if timeout_trigger else SUMMARY_PROMPT_TEMPLATE
     prompt = template.format(
@@ -564,13 +729,15 @@ async def summarize(
 def process_message(
     client: anthropic.AsyncAnthropic,
     config: Config,
-    model: str,
+    model: ModelInfo,
+    effort: str,
     chat_id: int,
     user_id: int,
     new_content: list[dict] | str,
     user_tz: str,
     db_history: dict,
-) -> AsyncGenerator[tuple[str, anthropic.Usage | None], None]:
+    user_name: str | None = None,
+) -> AsyncGenerator[tuple[str, TurnUsage | None], None]:
     """Точка входа для обработки входящего сообщения.
 
     Обычная (не async) функция - возвращает async generator напрямую.
@@ -579,6 +746,9 @@ def process_message(
     raw = db_history.get("messages_json") or "[]"
     live_history: list[dict] = json.loads(raw)
     summary: str | None = db_history.get("summary")
-    system = _build_system_prompt(config, user_tz)
-    messages = _build_messages(live_history, summary, new_content)
-    return stream_response(client, config, model, messages, system, chat_id=chat_id, user_id=user_id)
+    system = _build_system_prompt(config)
+    turn_context = _turn_context(config, user_tz, user_name)
+    messages = _build_messages(live_history, summary, new_content, turn_context)
+    return stream_response(
+        client, config, model, effort, messages, system, chat_id=chat_id, user_id=user_id,
+    )

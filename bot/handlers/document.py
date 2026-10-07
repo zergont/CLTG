@@ -97,5 +97,4 @@ async def handle_document(
         config=config,
         client=client,
         content=content,
-        notify_admin=kwargs.get("notify_admin"),
     )

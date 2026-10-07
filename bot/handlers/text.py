@@ -3,8 +3,8 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
+from zoneinfo import ZoneInfo
 
-import pytz
 from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -59,7 +59,7 @@ async def cmd_help(message: Message, config: "Config", **kwargs) -> None:
     if is_admin:
         text += (
             "\n<b>Команды администратора:</b>\n"
-            "/model — сменить модель Claude\n"
+            "/model — модель Claude и уровень размышлений\n"
             "/ban &lt;user_id&gt; — заблокировать пользователя\n"
             "/unban &lt;user_id&gt; — разблокировать\n"
             "/users — список всех пользователей\n"
@@ -104,8 +104,7 @@ def _format_due(due_str: str, user_tz: str) -> str:
         dt = datetime.fromisoformat(due_str)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        tz = pytz.timezone(user_tz)
-        return dt.astimezone(tz).strftime("%d.%m.%Y %H:%M %Z")
+        return dt.astimezone(ZoneInfo(user_tz)).strftime("%d.%m.%Y %H:%M %Z")
     except Exception:
         return due_str
 
@@ -215,5 +214,4 @@ async def handle_text(
         config=config,
         client=client,
         content=message.text,
-        notify_admin=kwargs.get("notify_admin"),
     )
