@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 # Цены — USD за 1M токенов, по https://platform.claude.com/docs/en/about-claude/pricing (октябрь 2026).
-# cache_write — запись в 5-минутный кэш, cache_read — чтение из кэша.
+# cache_write — запись в 5-минутный кэш, cache_write_1h — в часовой, cache_read — чтение из кэша.
 
 # Стоимость одного нативного web_search ($10 за 1000 запросов)
 WEB_SEARCH_PRICE = 0.01
@@ -15,6 +15,7 @@ class Pricing:
     input: float
     output: float
     cache_write: float
+    cache_write_1h: float
     cache_read: float
 
 
@@ -45,15 +46,15 @@ MODELS: dict[str, ModelInfo] = {
             id="claude-haiku-5-5",
             label="Claude Haiku 5.5 (быстрая)",
             context_window=1_000_000,
-            pricing=Pricing(input=0.10, output=0.50, cache_write=0.125, cache_read=0.01),
-            long_pricing=Pricing(input=0.50, output=2.50, cache_write=0.625, cache_read=0.05),
+            pricing=Pricing(input=0.10, output=0.50, cache_write=0.125, cache_write_1h=0.20, cache_read=0.01),
+            long_pricing=Pricing(input=0.50, output=2.50, cache_write=0.625, cache_write_1h=1.00, cache_read=0.05),
             long_threshold=100_000,
         ),
         ModelInfo(
             id="claude-sonnet-5-5",
             label="Claude Sonnet 5.5 (умная)",
             context_window=1_000_000,
-            pricing=Pricing(input=2.00, output=10.00, cache_write=2.50, cache_read=0.10),
+            pricing=Pricing(input=2.00, output=10.00, cache_write=2.50, cache_write_1h=4.00, cache_read=0.10),
             web_search_tool="web_search_20260209",
             server_fallback=True,
         ),
@@ -61,7 +62,7 @@ MODELS: dict[str, ModelInfo] = {
             id="claude-opus-5-5",
             label="Claude Opus 5.5 (максимум)",
             context_window=1_000_000,
-            pricing=Pricing(input=4.00, output=20.00, cache_write=5.00, cache_read=0.20),
+            pricing=Pricing(input=4.00, output=20.00, cache_write=5.00, cache_write_1h=8.00, cache_read=0.20),
             web_search_tool="web_search_20260209",
             server_fallback=True,
         ),
@@ -104,10 +105,18 @@ def calc_cost(model: ModelInfo, usage: Any) -> float:
     cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
     prices = model.pricing_for(input_tokens + cache_write + cache_read)
 
+    # Запись в 5-минутный и часовой кэш стоит по-разному; без разбивки считаем по часовому
+    breakdown = getattr(usage, "cache_creation", None)
+    write_5m = getattr(breakdown, "ephemeral_5m_input_tokens", None)
+    write_1h = getattr(breakdown, "ephemeral_1h_input_tokens", None)
+    if write_5m is None and write_1h is None:
+        write_5m, write_1h = 0, cache_write
+
     cost = (
         input_tokens * prices.input
         + (usage.output_tokens or 0) * prices.output
-        + cache_write * prices.cache_write
+        + (write_5m or 0) * prices.cache_write
+        + (write_1h or 0) * prices.cache_write_1h
         + cache_read * prices.cache_read
     ) / 1_000_000
 

@@ -35,7 +35,7 @@ async def collect(gen):
 def test_system_prompt_is_static(config):
     system = chat._build_system_prompt(config)
     assert len(system) == 1
-    assert system[0]["cache_control"] == {"type": "ephemeral"}
+    assert system[0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
     assert "Текущее время:" not in system[0]["text"]
 
 
@@ -57,8 +57,8 @@ def test_turn_context_is_appended_to_new_message_and_history_is_cached(config):
     assert "UTC+03:00" in extra["text"]
     assert "cache_control" not in extra
     # Кэш-маркеры: саммари и последнее сообщение истории
-    assert messages[0]["content"][0]["cache_control"] == {"type": "ephemeral"}
-    assert messages[3]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert messages[0]["content"][0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert messages[3]["content"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
 
 
 def test_turn_context_follows_image_content(config):
@@ -66,6 +66,19 @@ def test_turn_context_follows_image_content(config):
     caption = {"type": "text", "text": "что на фото?"}
     messages = chat._build_messages([], None, [image, caption], "контекст")
     assert messages[-1]["content"] == [image, caption, {"type": "text", "text": "контекст"}]
+
+
+def test_cache_ttl_follows_config(config, monkeypatch):
+    monkeypatch.setenv("CACHE_TTL", "5m")
+    from bot.config import load_config
+
+    cfg = load_config()
+    assert chat._build_system_prompt(cfg)[0]["cache_control"] == {"type": "ephemeral", "ttl": "5m"}
+    messages = chat._build_messages(
+        [{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}],
+        None, "c", "ctx", cache_ttl=cfg.cache_ttl,
+    )
+    assert messages[-2]["content"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "5m"}
 
 
 def test_unknown_timezone_falls_back_to_default(config):

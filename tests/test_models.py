@@ -30,6 +30,20 @@ def test_haiku_long_prompt_uses_higher_rate_card():
 
 def test_sonnet_cache_and_web_search_cost():
     sonnet = MODELS["claude-sonnet-5-5"]
-    usage = make_usage(input_tokens=1_000, output_tokens=2_000, cache_write=10_000, cache_read=50_000, searches=3)
-    expected = (1_000 * 2.0 + 2_000 * 10.0 + 10_000 * 2.5 + 50_000 * 0.10) / 1_000_000 + 3 * 0.01
+    usage = make_usage(
+        input_tokens=1_000, output_tokens=2_000, cache_write_1h=10_000, cache_read=50_000, searches=3,
+    )
+    expected = (1_000 * 2.0 + 2_000 * 10.0 + 10_000 * 4.0 + 50_000 * 0.10) / 1_000_000 + 3 * 0.01
     assert calc_cost(sonnet, usage) == pytest.approx(expected)
+
+
+def test_cache_write_priced_by_ttl():
+    opus = MODELS["claude-opus-5-5"]
+    usage = make_usage(input_tokens=0, output_tokens=0, cache_write_5m=1_000_000, cache_write_1h=1_000_000)
+    assert calc_cost(opus, usage) == pytest.approx(5.00 + 8.00)
+
+
+def test_cache_write_without_breakdown_uses_1h_rate():
+    haiku = MODELS["claude-haiku-5-5"]
+    usage = make_usage(input_tokens=0, output_tokens=0, cache_write=50_000)
+    assert calc_cost(haiku, usage) == pytest.approx(50_000 * 0.20 / 1_000_000)

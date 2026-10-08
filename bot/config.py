@@ -22,6 +22,13 @@ def _parse_duration_seconds(value: str) -> int:
     return int(value)
 
 
+def _parse_cache_ttl(value: str) -> str:
+    value = value.strip().lower()
+    if value not in ("5m", "1h"):
+        raise RuntimeError(f"CACHE_TTL должен быть 5m или 1h, получено: {value!r}")
+    return value
+
+
 @dataclass(frozen=True)
 class Config:
     # Telegram
@@ -40,6 +47,7 @@ class Config:
 
     # Контекст и саммаризация
     context_budget_tokens: int    # рабочий бюджет контекста (меньше окна модели)
+    cache_ttl: str                # время жизни кэша промпта: 5m | 1h
     summary_trigger_tokens: float
     summary_trigger_hours: int
     summary_keep_last: int
@@ -77,7 +85,8 @@ def load_config() -> Config:
             "Ты полезный ассистент. Текущее время передаётся в каждом сообщении.",
         ),
         default_timezone=os.getenv("DEFAULT_TIMEZONE", "Europe/Moscow"),
-        context_budget_tokens=int(os.getenv("CONTEXT_BUDGET_TOKENS", "100000")),
+        context_budget_tokens=int(os.getenv("CONTEXT_BUDGET_TOKENS", "300000")),
+        cache_ttl=_parse_cache_ttl(os.getenv("CACHE_TTL", "1h")),
         summary_trigger_tokens=float(os.getenv("SUMMARY_TRIGGER_TOKENS", "0.85")),
         summary_trigger_hours=int(os.getenv("SUMMARY_TRIGGER_HOURS", "72")),
         summary_keep_last=int(os.getenv("SUMMARY_KEEP_LAST", "10")),

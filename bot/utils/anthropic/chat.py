@@ -258,6 +258,12 @@ async def _searxng_search(query: str, searxng_url: str, max_results: int = 5) ->
         return f"Поиск временно недоступен: {exc}"
 
 
+def _cache_control(ttl: str) -> dict:
+    """Маркер кэша промпта. Часовой кэш дороже при записи (2x против 1.25x),
+    но переживает паузы до часа — в семейном чате это обычно выгоднее 5 минут."""
+    return {"type": "ephemeral", "ttl": ttl}
+
+
 def _build_system_prompt(config: Config) -> list[dict]:
     """Статический system-блок с кэшированием.
 
@@ -332,7 +338,7 @@ def _build_system_prompt(config: Config) -> list[dict]:
         {
             "type": "text",
             "text": config.system_prompt + capabilities,
-            "cache_control": {"type": "ephemeral"},
+            "cache_control": _cache_control(config.cache_ttl),
         },
     ]
 
@@ -406,6 +412,7 @@ def _build_messages(
     summary: str | None,
     new_content: list[dict] | str,
     turn_context: str,
+    cache_ttl: str = "1h",
 ) -> list[dict]:
     """Формирует итоговый массив messages[] для API с маркерами кэширования.
 
@@ -417,6 +424,7 @@ def _build_messages(
       [user: new_content + собеседник/время] — БЕЗ cache_control: время меняется каждую минуту
     """
     messages: list[dict] = []
+    cache_control = _cache_control(cache_ttl)
 
     # --- саммари ---
     if summary:
@@ -426,7 +434,7 @@ def _build_messages(
                 {
                     "type": "text",
                     "text": f"SUMMARY: {summary}",
-                    "cache_control": {"type": "ephemeral"},
+                    "cache_control": cache_control,
                 }
             ],
         })
@@ -451,14 +459,14 @@ def _build_messages(
                 {
                     "type": "text",
                     "text": content,
-                    "cache_control": {"type": "ephemeral"},
+                    "cache_control": cache_control,
                 }
             ]
         elif isinstance(content, list):
             cached_content = list(content)
             if cached_content:
                 last_block = dict(cached_content[-1])
-                last_block["cache_control"] = {"type": "ephemeral"}
+                last_block["cache_control"] = cache_control
                 cached_content[-1] = last_block
         else:
             cached_content = content
@@ -801,7 +809,9 @@ def process_message(
     summary: str | None = db_history.get("summary")
     system = _build_system_prompt(config)
     turn_context = _turn_context(config, user_tz, user_name)
-    messages = _build_messages(live_history, summary, new_content, turn_context)
+    messages = _build_messages(
+        live_history, summary, new_content, turn_context, cache_ttl=config.cache_ttl,
+    )
     return stream_response(
         client, config, model, effort, messages, system, chat_id=chat_id, user_id=user_id,
     )

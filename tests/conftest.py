@@ -27,11 +27,22 @@ def db_path(tmp_path, monkeypatch):
     return path
 
 
-def make_usage(input_tokens=100, output_tokens=50, cache_write=0, cache_read=0, searches=0):
+def make_usage(
+    input_tokens=100, output_tokens=50, cache_write=0, cache_read=0, searches=0,
+    cache_write_5m=None, cache_write_1h=None,
+):
+    breakdown = None
+    if cache_write_5m is not None or cache_write_1h is not None:
+        breakdown = SimpleNamespace(
+            ephemeral_5m_input_tokens=cache_write_5m or 0,
+            ephemeral_1h_input_tokens=cache_write_1h or 0,
+        )
+        cache_write = (cache_write_5m or 0) + (cache_write_1h or 0)
     return SimpleNamespace(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         cache_creation_input_tokens=cache_write,
+        cache_creation=breakdown,
         cache_read_input_tokens=cache_read,
         server_tool_use=SimpleNamespace(web_search_requests=searches) if searches else None,
     )
