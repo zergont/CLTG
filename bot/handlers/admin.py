@@ -13,6 +13,7 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from bot.handlers._common import context_budget
 from bot.utils import db
 from bot.utils.anthropic.models import EFFORT_LABELS, MODELS, ModelInfo
+from bot.utils.errors import close_menu
 from bot.utils.html import split_long_message
 
 if TYPE_CHECKING:
@@ -85,7 +86,7 @@ async def cb_model(callback: CallbackQuery, config: "Config", **kwargs) -> None:
     value = rest[0] if rest else ""
 
     if action in ("close", "cancel"):
-        await callback.message.delete()  # type: ignore[union-attr]
+        await close_menu(callback.message)  # type: ignore[arg-type]
         await callback.answer()
         return
 

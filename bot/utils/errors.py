@@ -4,7 +4,8 @@ import logging
 import asyncio
 
 import anthropic
-from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
+from aiogram.types import Message
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,21 @@ async def handle_telegram_error(
         return False  # можно повторить
     logger.error("Telegram ошибка для chat_id=%s: %s", chat_id, exc, exc_info=True)
     return False
+
+
+async def close_menu(message: Message) -> None:
+    """Закрывает inline-меню: удаляет сообщение, а если нельзя — убирает кнопки.
+
+    Удалить не получится, если сообщение уже удалено (двойное нажатие «Закрыть»)
+    или старше 48 часов — это не ошибка бота, баг-репорт не нужен.
+    """
+    try:
+        await message.delete()
+    except TelegramBadRequest:
+        try:
+            await message.edit_reply_markup(reply_markup=None)
+        except TelegramBadRequest:
+            pass
 
 
 def user_error_message(exc: Exception) -> str:

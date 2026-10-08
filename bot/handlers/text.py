@@ -11,6 +11,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from bot.keyboards import setup_commands, get_main_keyboard
 from bot.utils import db
+from bot.utils.errors import close_menu
 from bot.handlers._common import TRANSIENT_API_ERRORS, handle_incoming, reset_dialogue
 
 if TYPE_CHECKING:
@@ -220,7 +221,7 @@ async def cb_rem(callback: CallbackQuery, config: "Config", **kwargs) -> None:
     action = callback.data.split(":", 1)[1]  # type: ignore[union-attr]
 
     if action == "cancel":
-        await callback.message.delete()  # type: ignore[union-attr]
+        await close_menu(callback.message)  # type: ignore[arg-type]
         await callback.answer()
         return
 
