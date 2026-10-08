@@ -21,7 +21,7 @@ from bot.utils.anthropic.chat import (
     summarize,
 )
 from bot.utils.anthropic.models import ModelInfo
-from bot.utils.errors import user_error_message
+from bot.utils.errors import log_api_error, user_error_message
 from bot.utils.html import TELEGRAM_MAX_LENGTH, markdown_to_html, split_long_message
 from bot.utils.prompts import TIMEZONE_DETECT_PROMPT
 
@@ -35,14 +35,6 @@ logger = logging.getLogger(__name__)
 STREAM_UPDATE_INTERVAL = 1.5
 # Длина куска ответа: запас под HTML-теги и экранирование до лимита Telegram
 TELEGRAM_SAFE_LENGTH = 3800
-
-# Временные сбои API: пользователю — понятное сообщение, в лог — WARNING без баг-репорта
-TRANSIENT_API_ERRORS = (
-    anthropic.RateLimitError,
-    anthropic.InternalServerError,
-    anthropic.APIConnectionError,  # включая APITimeoutError
-    asyncio.TimeoutError,
-)
 
 # Ссылки на фоновые задачи, чтобы их не собрал сборщик мусора
 _background_tasks: set[asyncio.Task] = set()
@@ -225,12 +217,12 @@ async def handle_incoming(
                 usage = chunk_usage
 
     except Exception as exc:
-        if isinstance(exc, TRANSIENT_API_ERRORS):
-            # Временный сбой API (SDK уже сделал повторы) — не баг, баг-репорт не нужен
-            logger.warning("Временная ошибка Claude API для chat_id=%d: %r", chat_id, exc)
-        else:
-            # ERROR уходит администратору баг-репортом (в т.ч. неверный ключ, 400, баги кода)
-            logger.exception("Ошибка при обработке сообщения chat_id=%d, user_id=%d", chat_id, user_id)
+        # Нет денег — срочное оповещение админу; временный сбой — WARNING;
+        # остальное (неверный ключ, 400, баги кода) — баг-репорт
+        await log_api_error(
+            logger, exc, f"Ошибка при обработке сообщения chat_id={chat_id}, user_id={user_id}",
+            message.bot, config.admin_id,
+        )
         await thinking_msg.edit_text(user_error_message(exc))
         return
 
@@ -292,8 +284,11 @@ async def handle_incoming(
                 summary_updated_at=datetime.now(timezone.utc),
             )
             logger.info("Саммаризация выполнена для chat_id=%d", chat_id)
-        except Exception:
-            logger.exception("Ошибка саммаризации для chat_id=%d", chat_id)
+        except Exception as exc:
+            await log_api_error(
+                logger, exc, f"Ошибка саммаризации для chat_id={chat_id}",
+                message.bot, config.admin_id,
+            )
 
     # Фоновое определение часового пояса (раз в 10 сообщений; после саммаризации история пуста)
     if live_history and len(live_history) % 10 == 0:

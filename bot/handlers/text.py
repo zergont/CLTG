@@ -11,8 +11,8 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from bot.keyboards import setup_commands, get_main_keyboard
 from bot.utils import db
-from bot.utils.errors import close_menu
-from bot.handlers._common import TRANSIENT_API_ERRORS, handle_incoming, reset_dialogue
+from bot.utils.errors import close_menu, is_billing_error, log_api_error, user_error_message
+from bot.handlers._common import handle_incoming, reset_dialogue
 
 if TYPE_CHECKING:
     import anthropic
@@ -85,12 +85,12 @@ async def cmd_reset(
             client, config, message.chat.id, message.from_user.id,  # type: ignore[union-attr]
         )
     except Exception as exc:
-        if isinstance(exc, TRANSIENT_API_ERRORS):
-            logger.warning("Временная ошибка Claude API при /reset chat_id=%d: %r", message.chat.id, exc)
-        else:
-            logger.exception("Ошибка /reset для chat_id=%d", message.chat.id)
+        await log_api_error(
+            logger, exc, f"Ошибка /reset для chat_id={message.chat.id}", message.bot, config.admin_id,
+        )
+        reason = user_error_message(exc) + "\n\n" if is_billing_error(exc) else ""
         await status.edit_text(
-            "❌ Не удалось сохранить факты, поэтому диалог не сброшен. Попробуйте позже.\n"
+            f"{reason}❌ Не удалось сохранить факты, поэтому диалог не сброшен. Попробуйте позже.\n"
             "Забыть всё без сохранения: /kill"
         )
         return

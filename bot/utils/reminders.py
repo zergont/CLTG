@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 
 from bot.utils import db
 from bot.utils.anthropic.chat import call_claude_isolated
-from bot.utils.errors import handle_telegram_error
+from bot.utils.errors import handle_telegram_error, log_api_error
 
 if TYPE_CHECKING:
     import anthropic
@@ -108,9 +108,12 @@ async def _fire_reminder(
                 if response_text.strip():
                     send_text = response_text
                     history_assistant = response_text
-            except Exception:
+            except Exception as exc:
                 # Не удалось сгенерировать — отправляем обычный текст напоминания
-                logger.exception("Ошибка генерации текста напоминания #%d", reminder_id)
+                await log_api_error(
+                    logger, exc, f"Ошибка генерации текста напоминания #{reminder_id}",
+                    bot, config.admin_id,
+                )
 
         # Отправляем сообщение
         try:
