@@ -15,7 +15,7 @@ python-dotenv = "^1.2.4"
 aiosqlite = "^0.22.1"
 tzdata = ">=2026.5"
 pillow = "^12.3.0"
-ddgs = "^9.14.4"
+ddgs = "==9.14.4"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.0.0"
