@@ -85,6 +85,36 @@ REMINDER_TOOL: dict = {
 }
 
 
+WEB_FETCH_PROMPT = (
+    "### 🌐 web_fetch\n"
+    "Открывает страницу или PDF по ссылке и возвращает её полный текст.\n\n"
+    "**Когда использовать:**\n"
+    "- Пользователь прислал ссылку и просит пересказать, проверить или ответить по ней\n"
+    "- Фрагментов из результатов web_search не хватает для точного ответа — "
+    "открой одну-две самые подходящие страницы\n\n"
+    "**Ограничения:**\n"
+    "- Открывать можно только ссылки, которые уже есть в диалоге: из сообщений пользователя "
+    "или из результатов поиска\n"
+    "- Не открывай страницы без необходимости: каждая страница — это время и деньги\n"
+    "- Страницы, которые рисуются JavaScript'ом, могут не загрузиться — тогда скажи об этом\n\n"
+)
+
+
+def _web_fetch_tool(model: ModelInfo, config: Config) -> dict:
+    """Нативный web_fetch Anthropic: открывает страницу или PDF по ссылке из диалога.
+
+    Отдельной платы нет — только токены текста страницы. Страницы загружает
+    Anthropic (не наш сервер), открывать можно лишь ссылки, уже бывшие в диалоге:
+    из сообщений пользователя и из результатов поиска.
+    """
+    return {
+        "type": model.web_fetch_tool,
+        "name": "web_fetch",
+        "max_uses": config.web_fetch_max_uses,
+        "max_content_tokens": config.web_fetch_max_tokens,
+    }
+
+
 def _native_web_search_tool(model: ModelInfo) -> dict:
     """Нативный web_search Anthropic (платный: $0.01 за запрос + токены результатов)."""
     return {"type": model.web_search_tool, "name": "web_search"}
@@ -320,7 +350,8 @@ def _build_system_prompt(config: Config) -> list[dict]:
         "- Для технических тем формулируй запрос на английском — результаты будут точнее\n"
         "- Используй конкретные ключевые слова, а не полные предложения\n"
         "- Если первый поиск не дал результата — перефразируй запрос\n\n"
-        "### ⏰ create_reminder\n"
+        + (WEB_FETCH_PROMPT if config.web_fetch else "")
+        + "### ⏰ create_reminder\n"
         "Создание напоминаний, будильников и повторяющихся уведомлений.\n\n"
         "**Когда использовать:**\n"
         "- Любая просьба напомнить о чём-то: «напомни через 30 минут», «напомни завтра в 9»\n"
@@ -590,7 +621,10 @@ async def stream_response(
     current_messages = list(messages)
     has_text = False
 
-    active_tools: list[dict] = [await _search_tool(model), REMINDER_TOOL]
+    active_tools: list[dict] = [await _search_tool(model)]
+    if config.web_fetch:
+        active_tools.append(_web_fetch_tool(model, config))
+    active_tools.append(REMINDER_TOOL)
 
     for _iteration in range(MAX_TOOL_ITERATIONS):
         params = _request_params(

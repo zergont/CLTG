@@ -30,6 +30,8 @@ class ModelInfo:
     long_threshold: int = 0
     # Версия нативного web_search (новая версия доступна не всем моделям)
     web_search_tool: str = "web_search_20250305"
+    # Версия web_fetch: 20260318 — с динамической фильтрацией (проверено на Haiku/Sonnet/Opus 5.5)
+    web_fetch_tool: str = "web_fetch_20260318"
     # Серверный fallback при отказе модели (fallbacks: "default", только Sonnet/Opus)
     server_fallback: bool = False
 

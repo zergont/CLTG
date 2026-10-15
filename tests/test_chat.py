@@ -127,6 +127,33 @@ async def test_sonnet_uses_server_fallback_and_new_web_search(config, monkeypatc
     assert params["tools"][0] == {"type": "web_search_20260209", "name": "web_search"}
 
 
+# ── Чтение страниц (web_fetch) ──────────────────────────────
+
+async def test_web_fetch_tool_is_offered_with_limits(config, monkeypatch):
+    monkeypatch.setattr(chat, "_search_engine", "ddgs")
+    client = FakeClient([(["ok"], make_message([text_block("ok")]))])
+    await collect(chat.stream_response(client, config, HAIKU, "low", [], []))
+
+    tools = client.messages.calls[0]["tools"]
+    assert [t["name"] for t in tools] == ["web_search", "web_fetch", "create_reminder"]
+    assert tools[1] == {
+        "type": "web_fetch_20260318", "name": "web_fetch",
+        "max_uses": config.web_fetch_max_uses, "max_content_tokens": config.web_fetch_max_tokens,
+    }
+    assert "### 🌐 web_fetch" in chat._build_system_prompt(config)[0]["text"]
+
+
+async def test_web_fetch_can_be_disabled(config, monkeypatch):
+    monkeypatch.setenv("WEB_FETCH", "0")
+    from bot.config import load_config
+
+    cfg = load_config()
+    client = FakeClient([(["ok"], make_message([text_block("ok")]))])
+    await collect(chat.stream_response(client, cfg, HAIKU, "low", [], []))
+    assert "web_fetch" not in [t["name"] for t in client.messages.calls[0]["tools"]]
+    assert "web_fetch" not in chat._build_system_prompt(cfg)[0]["text"]
+
+
 # ── Режимы поиска ───────────────────────────────────────────
 
 def _no_network_check(monkeypatch, result: bool) -> list[int]:

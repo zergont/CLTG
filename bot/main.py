@@ -13,6 +13,7 @@ from bot.config import load_config
 from bot.keyboards import setup_commands
 from bot.middlewares import RegisterUserMiddleware
 from bot.utils import db
+from bot.utils.anthropic.models import EFFORT_LABELS
 from bot.utils.bug_report import setup_bug_reports
 from bot.utils.errors import handle_telegram_error
 from bot.utils.log import setup_logging
@@ -93,33 +94,29 @@ async def main() -> None:
     # Настройка команд в меню Telegram
     await setup_commands(bot, config.admin_id)
 
-    async def broadcast_startup() -> None:
-        """Рассылает приветствие всем активным пользователям при старте бота."""
-        users = await db.get_all_active_users()
-        if not users:
-            return
-        logger.info("Рассылка приветствия %d пользователям...", len(users))
-        ok = 0
-        for user in users:
-            try:
-                name = user["first_name"] or "друг"
-                await bot.send_message(
-                    user["user_id"],
-                    f"👋 Привет, <b>{name}</b>! Бот запущен и готов к работе.",
-                    parse_mode="HTML",
-                )
-                ok += 1
-            except Exception as exc:
-                await handle_telegram_error(exc, chat_id=user["user_id"], user_id=user["user_id"])
-        logger.info("Приветствие отправлено %d/%d пользователям", ok, len(users))
+    async def notify_admin_startup() -> None:
+        """Сообщает администратору о запуске бота и текущих настройках."""
+        model, effort = await db.get_model_settings()
+        fetch = "вкл" if config.web_fetch else "выкл"
+        try:
+            await bot.send_message(
+                config.admin_id,
+                "🟢 <b>Бот перезапущен</b>\n\n"
+                f"Модель: {model.label}, размышления: {EFFORT_LABELS[effort].lower()}\n"
+                f"Поиск: {config.search_engine}, чтение страниц: {fetch}",
+                parse_mode="HTML",
+            )
+            logger.info("Администратору отправлено уведомление о запуске")
+        except Exception as exc:
+            await handle_telegram_error(exc, chat_id=config.admin_id, user_id=config.admin_id)
 
     # Запуск планировщика напоминаний
     scheduler_task = asyncio.create_task(
         run_scheduler(bot, config, client)
     )
 
-    # Рассылка приветствия при старте
-    dp.startup.register(broadcast_startup)
+    # Уведомление о запуске — только администратору
+    dp.startup.register(notify_admin_startup)
 
     logger.info("Бот запущен. Polling...")
 

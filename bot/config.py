@@ -67,6 +67,11 @@ class Config:
     debug_mode: bool
     bug_reports: bool   # отправлять ошибки из логов администратору
 
+    # Чтение веб-страниц (нативный web_fetch Anthropic)
+    web_fetch: bool
+    web_fetch_max_tokens: int     # предел текста одной страницы (на PDF не действует)
+    web_fetch_max_uses: int       # сколько страниц можно открыть за один ответ
+
     # SearXNG
     searxng_url: str
     search_engine: str  # ddgs | searxng | auto | native
@@ -99,6 +104,9 @@ def load_config() -> Config:
         reminder_default_silent=bool(int(os.getenv("REMINDER_DEFAULT_SILENT", "1"))),
         debug_mode=bool(int(os.getenv("DEBUG_MODE", "0"))),
         bug_reports=bool(int(os.getenv("BUG_REPORTS", "1"))),
+        web_fetch=bool(int(os.getenv("WEB_FETCH", "1"))),
+        web_fetch_max_tokens=int(os.getenv("WEB_FETCH_MAX_TOKENS", "20000")),
+        web_fetch_max_uses=int(os.getenv("WEB_FETCH_MAX_USES", "5")),
         searxng_url=os.getenv("SEARXNG_URL", "http://localhost:8888"),
         search_engine=os.getenv("SEARCH_ENGINE", "ddgs"),
     )
