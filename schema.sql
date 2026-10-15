@@ -21,7 +21,10 @@ CREATE TABLE IF NOT EXISTS users (
     first_seen  DATETIME DEFAULT CURRENT_TIMESTAMP,
     is_welcomed BOOLEAN  DEFAULT FALSE,
     timezone    TEXT     DEFAULT 'Europe/Moscow',
-    is_banned   BOOLEAN  DEFAULT FALSE
+    is_banned   BOOLEAN  DEFAULT FALSE,   -- забанен администратором
+    is_approved BOOLEAN  DEFAULT FALSE,   -- администратор открыл доступ
+    blocked_bot BOOLEAN  DEFAULT FALSE,   -- пользователь сам заблокировал бота
+    access_requested_at DATETIME          -- когда админу ушёл запрос на доступ
 );
 
 -- Настройки бота

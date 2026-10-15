@@ -75,8 +75,10 @@ async def main() -> None:
         )
         return True
 
-    # Middleware
-    dp.message.middleware(RegisterUserMiddleware())
+    # Middleware: регистрация и проверка доступа (сообщения и кнопки)
+    access_middleware = RegisterUserMiddleware()
+    dp.message.middleware(access_middleware)
+    dp.callback_query.middleware(access_middleware)
 
     # Данные для инъекции в хендлеры
     dp["config"] = config

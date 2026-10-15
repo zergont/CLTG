@@ -55,6 +55,19 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
         await conn.commit()
         logger.info("Миграция: добавлены колонки cache_write_tokens, cache_read_tokens")
 
+    # users: доступ по одобрению администратора (v1.3.0)
+    cursor = await conn.execute("PRAGMA table_info(users)")
+    user_columns = {row[1] for row in await cursor.fetchall()}
+    if "is_approved" not in user_columns:
+        await conn.execute("ALTER TABLE users ADD COLUMN is_approved BOOLEAN DEFAULT FALSE")
+        await conn.execute("ALTER TABLE users ADD COLUMN blocked_bot BOOLEAN DEFAULT FALSE")
+        await conn.execute("ALTER TABLE users ADD COLUMN access_requested_at DATETIME")
+        # Те, кто уже пользуется ботом, сохраняют доступ. Помеченные 🚫 остаются
+        # без доступа: раньше так же помечали и тех, кто сам заблокировал бота
+        await conn.execute("UPDATE users SET is_approved = TRUE WHERE is_banned = FALSE")
+        await conn.commit()
+        logger.info("Миграция: доступ по одобрению, текущие пользователи одобрены")
+
     # bot_settings: устаревшие модели → актуальные (v1.2.0)
     cursor = await conn.execute("SELECT value FROM bot_settings WHERE key = 'current_model'")
     row = await cursor.fetchone()
@@ -80,6 +93,7 @@ async def upsert_user(
     """
     Создаёт или обновляет пользователя.
     Возвращает True если пользователь новый (is_welcomed=False).
+    Раз человек пишет боту, значит не блокирует его — снимаем пометку blocked_bot.
     """
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -88,9 +102,10 @@ async def upsert_user(
             INSERT INTO users (user_id, username, first_name, last_name)
             VALUES (?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
-                username   = excluded.username,
-                first_name = excluded.first_name,
-                last_name  = excluded.last_name
+                username    = excluded.username,
+                first_name  = excluded.first_name,
+                last_name   = excluded.last_name,
+                blocked_bot = FALSE
             """,
             (user_id, username, first_name, last_name),
         )
@@ -119,24 +134,41 @@ async def get_user(user_id: int) -> aiosqlite.Row | None:
             return await cur.fetchone()
 
 
-async def is_banned(user_id: int) -> bool:
+async def _update_user(sql: str, params: tuple) -> bool:
+    """Выполняет UPDATE по пользователю. Возвращает True, если пользователь найден."""
     async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT is_banned FROM users WHERE user_id = ?", (user_id,)
-        ) as cur:
-            row = await cur.fetchone()
-            return row is not None and bool(row["is_banned"])
-
-
-async def set_banned(user_id: int, banned: bool) -> bool:
-    """Возвращает True если пользователь найден."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "UPDATE users SET is_banned = ? WHERE user_id = ?", (banned, user_id)
-        )
+        cur = await db.execute(sql, params)
         await db.commit()
         return cur.rowcount > 0
+
+
+async def approve_user(user_id: int) -> bool:
+    """Открывает доступ (и снимает бан)."""
+    return await _update_user(
+        "UPDATE users SET is_approved = TRUE, is_banned = FALSE WHERE user_id = ?", (user_id,)
+    )
+
+
+async def ban_user(user_id: int) -> bool:
+    """Бан администратором: доступа нет, рассылки не приходят."""
+    return await _update_user(
+        "UPDATE users SET is_banned = TRUE, is_approved = FALSE WHERE user_id = ?", (user_id,)
+    )
+
+
+async def set_blocked_bot(user_id: int, blocked: bool) -> bool:
+    """Пользователь сам заблокировал бота в Telegram (это не бан)."""
+    return await _update_user(
+        "UPDATE users SET blocked_bot = ? WHERE user_id = ?", (blocked, user_id)
+    )
+
+
+async def mark_access_requested(user_id: int) -> bool:
+    """Отмечает запрос доступа. True — запрос новый и админа нужно уведомить."""
+    return await _update_user(
+        "UPDATE users SET access_requested_at = ? WHERE user_id = ? AND access_requested_at IS NULL",
+        (datetime.now(timezone.utc).isoformat(), user_id),
+    )
 
 
 async def update_timezone(user_id: int, tz: str) -> None:
@@ -151,17 +183,20 @@ async def get_all_users() -> list[aiosqlite.Row]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT user_id, username, first_name, is_banned, first_seen FROM users ORDER BY first_seen"
+            "SELECT user_id, username, first_name, is_banned, is_approved, blocked_bot, first_seen "
+            "FROM users ORDER BY first_seen"
         ) as cur:
             return await cur.fetchall()
 
 
 async def get_all_active_users() -> list[aiosqlite.Row]:
-    """Возвращает всех незабаненных пользователей для рассылки."""
+    """Пользователи для рассылки: с доступом, не забанены и не заблокировали бота."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT user_id, first_name FROM users WHERE is_banned = FALSE ORDER BY first_seen"
+            "SELECT user_id, first_name FROM users "
+            "WHERE is_approved = TRUE AND is_banned = FALSE AND blocked_bot = FALSE "
+            "ORDER BY first_seen"
         ) as cur:
             return await cur.fetchall()
 

@@ -62,8 +62,9 @@ async def cmd_help(message: Message, config: "Config", **kwargs) -> None:
         text += (
             "\n<b>Команды администратора:</b>\n"
             "/model — модель Claude и уровень размышлений\n"
+            "/approve &lt;user_id&gt; — открыть доступ\n"
             "/ban &lt;user_id&gt; — заблокировать пользователя\n"
-            "/unban &lt;user_id&gt; — разблокировать\n"
+            "/unban &lt;user_id&gt; — разблокировать и открыть доступ\n"
             "/users — список всех пользователей\n"
             "/usage — общая статистика расходов\n"
             "/context — заполнение контекстных окон\n"

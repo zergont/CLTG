@@ -23,6 +23,7 @@ USER_COMMANDS = [
 
 ADMIN_COMMANDS = USER_COMMANDS + [
     BotCommand(command="model",   description="Модель Claude и уровень размышлений"),
+    BotCommand(command="approve", description="Открыть доступ: /approve <user_id>"),
     BotCommand(command="ban",     description="Заблокировать: /ban <user_id>"),
     BotCommand(command="unban",   description="Разблокировать: /unban <user_id>"),
     BotCommand(command="users",   description="Список пользователей"),

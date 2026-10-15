@@ -98,11 +98,12 @@ async def handle_telegram_error(
     """
     if isinstance(exc, TelegramForbiddenError):
         logger.warning("Бот заблокирован пользователем chat_id=%s", chat_id)
-        # Помечаем пользователя в БД, чтобы больше не слать ему сообщения (ТЗ п.7.2)
+        # Помечаем, чтобы не слать ему рассылки (ТЗ п.7.2). Это не бан: если человек
+        # разблокирует бота и напишет снова, пометка снимется сама
         if user_id is not None:
             try:
                 from bot.utils import db
-                await db.set_banned(user_id, True)
+                await db.set_blocked_bot(user_id, True)
             except Exception:
                 logger.debug("Не удалось пометить user_id=%s как заблокировавшего бота", user_id)
         return True
