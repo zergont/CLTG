@@ -38,6 +38,10 @@ def setup_logging(config: Config) -> None:
 
     # Приглушаем шумные библиотеки
     logging.getLogger("aiogram").setLevel(logging.WARNING)
-    # anthropic SDK и SearXNG-клиент работают через httpx2 — иначе каждый запрос пишется в INFO
-    for name in ("httpx", "httpcore", "httpx2", "httpcore2"):
+    # anthropic SDK и SearXNG-клиент работают через httpx2, ddgs — через primp и httpx:
+    # иначе каждый HTTP-запрос (у ddgs — по несколько на поиск) пишется в INFO
+    for name in (
+        "httpx", "httpcore", "httpx2", "httpcore2",
+        "ddgs", "primp", "hickory_net", "hickory_resolver",
+    ):
         logging.getLogger(name).setLevel(logging.WARNING)

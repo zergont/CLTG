@@ -19,7 +19,7 @@ from bot.utils.anthropic.models import MODELS, SERVICE_EFFORT, ModelInfo, calc_c
 logger = logging.getLogger(__name__)
 
 # Режим поиска (auto | searxng | native) и доступность SearXNG — задаются init_searxng()
-_search_engine: str = "searxng"
+_search_engine: str = "ddgs"
 _searxng_url: str = ""
 _searxng_available: bool = False
 _searxng_checked_at: float = 0.0
@@ -93,6 +93,7 @@ def _native_web_search_tool(model: ModelInfo) -> dict:
 async def _search_tool(model: ModelInfo) -> dict:
     """Инструмент поиска для запроса с учётом режима SEARCH_ENGINE.
 
+    ddgs    — бесплатный метапоиск ddgs (тот же клиентский инструмент web_search);
     searxng — всегда бесплатный SearXNG (если он лежит, модель получит «поиск недоступен»);
     native  — всегда платный нативный поиск;
     auto    — SearXNG, а платный только пока SearXNG недоступен (с периодической перепроверкой).
@@ -218,14 +219,14 @@ async def _check_searxng() -> bool:
     return _searxng_available
 
 
-async def init_searxng(url: str, engine: str = "searxng") -> bool:
+async def init_searxng(url: str, engine: str = "ddgs") -> bool:
     """Задаёт режим поиска и проверяет SearXNG. Вызывается при старте бота.
 
     engine: searxng (только бесплатный SearXNG) | ddgs (DuckDuckGo через ddgs) |
             auto (SearXNG, при сбое — платный) | native (платный Anthropic web_search)
     """
     global _search_engine, _searxng_url
-    _search_engine = engine if engine in ("auto", "searxng", "native", "ddgs") else "searxng"
+    _search_engine = engine if engine in ("auto", "searxng", "native", "ddgs") else "ddgs"
     _searxng_url = url
 
     if _search_engine == "native":

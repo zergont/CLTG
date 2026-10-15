@@ -69,7 +69,7 @@ class Config:
 
     # SearXNG
     searxng_url: str
-    search_engine: str  # auto | searxng | native
+    search_engine: str  # ddgs | searxng | auto | native
 
 
 def load_config() -> Config:
@@ -100,5 +100,5 @@ def load_config() -> Config:
         debug_mode=bool(int(os.getenv("DEBUG_MODE", "0"))),
         bug_reports=bool(int(os.getenv("BUG_REPORTS", "1"))),
         searxng_url=os.getenv("SEARXNG_URL", "http://localhost:8888"),
-        search_engine=os.getenv("SEARCH_ENGINE", "searxng"),
+        search_engine=os.getenv("SEARCH_ENGINE", "ddgs"),
     )

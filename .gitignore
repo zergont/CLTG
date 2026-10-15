@@ -37,6 +37,11 @@ launch.vs.json
 *.suo
 *.user
 
+# Сервер: конфиг SearXNG с секретным ключом (создаёт install.sh), кэши инструментов
+searxng/
+.cache/
+.config/
+
 # OS
 .DS_Store
 Thumbs.db

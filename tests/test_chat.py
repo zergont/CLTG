@@ -141,6 +141,42 @@ def _no_network_check(monkeypatch, result: bool) -> list[int]:
     return calls
 
 
+async def test_ddgs_mode_uses_free_tool_and_ddgs_backend(config, monkeypatch):
+    monkeypatch.setattr(chat, "_search_engine", "ddgs")
+    calls = _no_network_check(monkeypatch, False)
+    assert await chat._search_tool(SONNET) is chat.WEB_SEARCH_TOOL
+    assert calls == []
+
+    queries: list[str] = []
+
+    async def fake_ddgs(query, max_results=5):
+        queries.append(query)
+        return f"ddgs: {query}"
+
+    async def forbidden_searxng(*args, **kwargs):
+        raise AssertionError("в режиме ddgs SearXNG не вызывается")
+
+    monkeypatch.setattr(chat, "_ddgs_search", fake_ddgs)
+    monkeypatch.setattr(chat, "_searxng_search", forbidden_searxng)
+    first = make_message(
+        [tool_use_block("t1", "web_search", {"query": "погода"})], stop_reason="tool_use",
+    )
+    client = FakeClient([([], first), (["Тепло."], make_message([text_block("Тепло.")]))])
+    text, _ = await collect(chat.stream_response(client, config, HAIKU, "low", [], []))
+
+    assert text == "Тепло." and queries == ["погода"]
+    assert client.messages.calls[1]["messages"][-1]["content"][0]["content"] == "ddgs: погода"
+
+
+async def test_init_defaults_unknown_engine_to_ddgs(monkeypatch):
+    # init_searxng меняет глобальное состояние — пусть monkeypatch вернёт его после теста
+    monkeypatch.setattr(chat, "_search_engine", chat._search_engine)
+    monkeypatch.setattr(chat, "_searxng_url", chat._searxng_url)
+    calls = _no_network_check(monkeypatch, True)
+    assert await chat.init_searxng("http://localhost:8888", "bogus") is True
+    assert chat._search_engine == "ddgs" and calls == []
+
+
 async def test_searxng_mode_never_uses_paid_search(monkeypatch):
     monkeypatch.setattr(chat, "_search_engine", "searxng")
     monkeypatch.setattr(chat, "_searxng_available", False)  # SearXNG лежит
@@ -168,6 +204,7 @@ async def test_auto_mode_uses_paid_search_while_searxng_down(monkeypatch):
 
 
 async def test_tool_loop_runs_search_and_continues(config, monkeypatch):
+    monkeypatch.setattr(chat, "_search_engine", "searxng")
     monkeypatch.setattr(chat, "_searxng_available", True)
 
     async def fake_search(query, url):
