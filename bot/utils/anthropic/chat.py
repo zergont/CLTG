@@ -221,15 +221,19 @@ async def _check_searxng() -> bool:
 async def init_searxng(url: str, engine: str = "searxng") -> bool:
     """Задаёт режим поиска и проверяет SearXNG. Вызывается при старте бота.
 
-    engine: searxng (только бесплатный SearXNG) | auto (SearXNG, при сбое — платный) | native
+    engine: searxng (только бесплатный SearXNG) | ddgs (DuckDuckGo через ddgs) |
+            auto (SearXNG, при сбое — платный) | native (платный Anthropic web_search)
     """
     global _search_engine, _searxng_url
-    _search_engine = engine if engine in ("auto", "searxng", "native") else "searxng"
+    _search_engine = engine if engine in ("auto", "searxng", "native", "ddgs") else "searxng"
     _searxng_url = url
 
     if _search_engine == "native":
         logger.info("🔍 Поисковый движок: нативный Anthropic web_search (платный)")
         return False
+    if _search_engine == "ddgs":
+        logger.info("🔍 Поисковый движок: ddgs (DuckDuckGo, бесплатный)")
+        return True
     return await _check_searxng()
 
 
@@ -256,6 +260,32 @@ async def _searxng_search(query: str, searxng_url: str, max_results: int = 5) ->
     except Exception as exc:
         logger.warning("Ошибка SearXNG поиска: %s", exc)
         return f"Поиск временно недоступен: {exc}"
+
+
+def _ddgs_search_sync(query: str, max_results: int = 5) -> str:
+    """Синхронный поиск через ddgs (DuckDuckGo), вызывается в отдельном потоке."""
+    from ddgs import DDGS
+
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=max_results))
+        if not results:
+            return "Поиск не вернул результатов."
+        lines = []
+        for i, item in enumerate(results, 1):
+            title = item.get("title", "")
+            url = item.get("href", "") or item.get("url", "")
+            content = item.get("body", "") or item.get("content", "")
+            lines.append(f"{i}. {title}\n   URL: {url}\n   {content}")
+        return "\n\n".join(lines)
+    except Exception as exc:
+        logger.warning("Ошибка ddgs поиска: %s", exc)
+        return f"Поиск временно недоступен: {exc}"
+
+
+async def _ddgs_search(query: str, max_results: int = 5) -> str:
+    """Асинхронная обёртка над ddgs (синхронная библиотека — в отдельном потоке)."""
+    return await asyncio.to_thread(_ddgs_search_sync, query, max_results)
 
 
 def _cache_control(ttl: str) -> dict:
@@ -617,10 +647,16 @@ async def stream_response(
         # Поисковые запросы выполняем параллельно
         if search_blocks:
             queries = [b.input.get("query", "") for b in search_blocks]  # type: ignore[union-attr]
-            logger.info("SearXNG поиск (%d запросов): %s", len(queries), queries)
-            search_results = await asyncio.gather(
-                *[_searxng_search(q, config.searxng_url) for q in queries]
-            )
+            if _search_engine == "ddgs":
+                logger.info("ddgs поиск (%d запросов): %s", len(queries), queries)
+                search_results = await asyncio.gather(
+                    *[_ddgs_search(q) for q in queries]
+                )
+            else:
+                logger.info("SearXNG поиск (%d запросов): %s", len(queries), queries)
+                search_results = await asyncio.gather(
+                    *[_searxng_search(q, config.searxng_url) for q in queries]
+                )
             tool_results.extend(
                 {
                     "type": "tool_result",
