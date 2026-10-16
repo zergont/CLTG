@@ -68,6 +68,7 @@ async def cmd_help(message: Message, config: "Config", **kwargs) -> None:
             "/users — список всех пользователей\n"
             "/usage — общая статистика расходов\n"
             "/context — заполнение контекстных окон\n"
+            "/backup — резервная копия базы файлом\n"
         )
     await message.answer(text, parse_mode="HTML")
 

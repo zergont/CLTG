@@ -178,7 +178,7 @@ async def test_ddgs_mode_uses_free_tool_and_ddgs_backend(config, monkeypatch):
 
     async def fake_ddgs(query, max_results=5):
         queries.append(query)
-        return f"ddgs: {query}"
+        return [{"title": f"ddgs: {query}", "url": "https://example.com", "content": "текст"}]
 
     async def forbidden_searxng(*args, **kwargs):
         raise AssertionError("в режиме ddgs SearXNG не вызывается")
@@ -192,7 +192,9 @@ async def test_ddgs_mode_uses_free_tool_and_ddgs_backend(config, monkeypatch):
     text, _ = await collect(chat.stream_response(client, config, HAIKU, "low", [], []))
 
     assert text == "Тепло." and queries == ["погода"]
-    assert client.messages.calls[1]["messages"][-1]["content"][0]["content"] == "ddgs: погода"
+    assert client.messages.calls[1]["messages"][-1]["content"][0]["content"] == (
+        "1. ddgs: погода\n   URL: https://example.com\n   текст"
+    )
 
 
 async def test_init_defaults_unknown_engine_to_ddgs(monkeypatch):
@@ -234,8 +236,8 @@ async def test_tool_loop_runs_search_and_continues(config, monkeypatch):
     monkeypatch.setattr(chat, "_search_engine", "searxng")
     monkeypatch.setattr(chat, "_searxng_available", True)
 
-    async def fake_search(query, url):
-        return f"результаты для {query}"
+    async def fake_search(query, max_results=5):
+        return [{"title": f"результаты для {query}", "url": "https://example.com", "content": ""}]
 
     monkeypatch.setattr(chat, "_searxng_search", fake_search)
     thinking = SimpleNamespace(type="thinking", thinking="", signature="sig")
@@ -253,7 +255,7 @@ async def test_tool_loop_runs_search_and_continues(config, monkeypatch):
     second_call = client.messages.calls[1]["messages"]
     # Ответ с размышлениями возвращается целиком, затем результаты инструмента
     assert second_call[-2]["content"][0] is thinking
-    assert second_call[-1]["content"][0]["content"] == "результаты для погода"
+    assert second_call[-1]["content"][0]["content"].startswith("1. результаты для погода")
     assert usage.input_tokens == 300
     assert usage.context_tokens == 230  # последний вызов: 200 + 30
 

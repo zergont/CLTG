@@ -19,9 +19,27 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _next_due(current_due: datetime, interval_seconds: int) -> datetime:
-    """Вычисляет следующее время срабатывания."""
-    return current_due + timedelta(seconds=interval_seconds)
+# Минимальный интервал повтора — защита от напоминаний «каждую секунду»
+MIN_INTERVAL_SECONDS = 60
+
+
+def _next_due(current_due: datetime, interval_seconds: int, now: datetime) -> tuple[datetime, int]:
+    """Следующее срабатывание в будущем и число пропущенных (если бот был выключен).
+
+    Пропущенные повторы не догоняются пачкой: сразу переходим к ближайшему будущему.
+    """
+    step = timedelta(seconds=max(interval_seconds, MIN_INTERVAL_SECONDS))
+    next_due = current_due + step
+    skipped = 0
+    if next_due <= now:
+        skipped = int((now - next_due) / step) + 1
+        next_due += step * skipped
+    return next_due, skipped
+
+
+def _parse_utc(value: str) -> datetime:
+    dt = datetime.fromisoformat(value)
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 def _parse_interval(meta: dict | None) -> int | None:
@@ -116,6 +134,7 @@ async def _fire_reminder(
                 )
 
         # Отправляем сообщение
+        delivered = True
         try:
             await bot.send_message(
                 chat_id=chat_id,
@@ -123,55 +142,53 @@ async def _fire_reminder(
                 disable_notification=silent,
             )
         except Exception as send_exc:
-            handled = await handle_telegram_error(send_exc, chat_id=chat_id, user_id=user_id)
-            if not handled:
+            if not await handle_telegram_error(send_exc, chat_id=chat_id, user_id=user_id):
                 raise
-            return  # бот заблокирован — прекращаем обработку
+            # Пользователь заблокировал бота: не повторяем бесконечно — разовое закрываем,
+            # повторяющееся переносим (вдруг разблокирует)
+            delivered = False
 
-        # Добавляем в историю диалога
-        history = await db.get_history(chat_id)
-        raw = history.get("messages_json") or "[]"
-        messages: list[dict] = json.loads(raw)
-        messages.append({"role": "user", "content": history_user})
-        messages.append({"role": "assistant", "content": history_assistant})
-        tokens = history.get("total_tokens_approx") or 0
-        await db.save_history(chat_id, messages, tokens)
+        if delivered:
+            # Добавляем в историю диалога
+            history = await db.get_history(chat_id)
+            raw = history.get("messages_json") or "[]"
+            messages: list[dict] = json.loads(raw)
+            messages.append({"role": "user", "content": history_user})
+            messages.append({"role": "assistant", "content": history_assistant})
+            tokens = history.get("total_tokens_approx") or 0
+            await db.save_history(chat_id, messages, tokens)
 
         # Планируем следующее срабатывание
         reschedule_at = None
         new_steps_left = None
 
         if is_chain:
-            interval = _parse_interval(meta)
-
-            # Проверяем ограничения
-            if steps_left is not None:
-                new_steps = steps_left - 1
-                if new_steps <= 0:
-                    reschedule_at = None  # завершаем
-                else:
-                    new_steps_left = new_steps
-                    reschedule_at = _next_due(
-                        datetime.fromisoformat(reminder["due_at"]),
-                        interval or 86400,
-                    )
-            else:
-                new_steps_left = None
-                reschedule_at = _next_due(
-                    datetime.fromisoformat(reminder["due_at"]),
-                    interval or 86400,
+            new_steps_left = steps_left - 1 if steps_left is not None else None
+            if new_steps_left is None or new_steps_left > 0:
+                reschedule_at, skipped = _next_due(
+                    _parse_utc(reminder["due_at"]),
+                    _parse_interval(meta) or 86400,
+                    now,
                 )
-
+                if skipped:
+                    logger.info(
+                        "Напоминание #%d: пропущено повторов за время простоя: %d", reminder_id, skipped,
+                    )
             # Проверяем end_at
-            if reschedule_at and end_at_str:
-                end_at = datetime.fromisoformat(end_at_str)
-                if end_at.tzinfo is None:
-                    end_at = end_at.replace(tzinfo=timezone.utc)
-                if reschedule_at > end_at:
-                    reschedule_at = None
+            if reschedule_at and end_at_str and reschedule_at > _parse_utc(end_at_str):
+                reschedule_at = None
 
         await db.complete_reminder(reminder_id, reschedule_at, new_steps_left)
-        logger.info("Напоминание #%d отправлено chat_id=%d", reminder_id, chat_id)
+        if delivered:
+            logger.info("Напоминание #%d отправлено chat_id=%d", reminder_id, chat_id)
 
     except Exception as e:
-        logger.exception("Ошибка при обработке напоминания #%d: %s", reminder_id, e)
+        # Сбой отправки: напоминание повторится через минуту, после нескольких неудач — failed
+        gave_up = await db.fail_reminder(reminder_id)
+        if gave_up:
+            logger.exception(
+                "Напоминание #%d не удалось отправить после %d попыток, отменено: %s",
+                reminder_id, db.REMINDER_MAX_ATTEMPTS, e,
+            )
+        else:
+            logger.warning("Ошибка при отправке напоминания #%d, будет повтор: %r", reminder_id, e)

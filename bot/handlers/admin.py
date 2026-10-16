@@ -15,6 +15,7 @@ from bot.handlers._common import context_budget
 from bot.middlewares import describe_user
 from bot.utils import db
 from bot.utils.anthropic.models import EFFORT_LABELS, MODELS, ModelInfo
+from bot.utils.backup import make_backup, send_backup
 from bot.utils.errors import close_menu, handle_telegram_error
 from bot.utils.html import split_long_message
 
@@ -264,6 +265,21 @@ async def cmd_users(message: Message, config: "Config", **kwargs) -> None:
     parts = split_long_message(full_text)
     for part in parts:
         await message.answer(part, parse_mode="HTML")
+
+
+@router.message(Command("backup"))
+async def cmd_backup(message: Message, config: "Config", **kwargs) -> None:
+    """Свежая резервная копия базы — файлом администратору."""
+    if not _admin_filter(message, config):
+        return
+    status = await message.answer("⏳ Делаю резервную копию базы…")
+    try:
+        path = await make_backup(config.backup_keep)
+        await send_backup(message.bot, config.admin_id, path)  # type: ignore[arg-type]
+        await status.delete()
+    except Exception:
+        logger.exception("Ошибка резервного копирования по команде /backup")
+        await status.edit_text("❌ Не удалось сделать резервную копию, подробности в баг-репорте.")
 
 
 @router.message(Command("usage"))

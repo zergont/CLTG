@@ -137,25 +137,18 @@ print('БД инициализирована.')
 " 2>/dev/null || echo "БД будет инициализирована при первом запуске."
 
 # ──────────────────────────────────────────
-# 10. Systemd сервисы
+# 10. Systemd сервис
 # ──────────────────────────────────────────
-echo "[10/10] Регистрация systemd-сервисов..."
-cp "$APP_DIR/deploy/systemd/cltg-bot.service"    /etc/systemd/system/
-cp "$APP_DIR/deploy/systemd/cltg-update.service" /etc/systemd/system/
-cp "$APP_DIR/deploy/systemd/cltg-update.timer"   /etc/systemd/system/
-
+echo "[10/10] Регистрация systemd-сервиса..."
+cp "$APP_DIR/deploy/systemd/cltg-bot.service" /etc/systemd/system/
 systemctl daemon-reload
-
-# Включить автозапуск
 systemctl enable cltg-bot
-systemctl enable cltg-update.timer
 
 # Запустить, только если .env уже заполнен (есть реальный токен)
 if grep -q "^BOT_TOKEN=.\+" "$APP_DIR/.env" 2>/dev/null; then
     systemctl start cltg-bot
-    systemctl start cltg-update.timer
     echo ""
-    echo "✅ Бот запущен как systemd-служба."
+    echo "✅ Бот запущен как systemd-служба (автозапуск при перезагрузке включён)."
     echo "   Статус:  sudo systemctl status cltg-bot"
     echo "   Логи:    sudo journalctl -u cltg-bot -f"
 else
@@ -167,18 +160,4 @@ fi
 
 echo ""
 echo "=== Установка завершена ==="
-echo "Автозапуск при перезагрузке сервера: ВКЛЮЧЁН (cltg-bot, cltg-update.timer)"
-
-systemctl daemon-reload
-systemctl enable cltg-bot.service
-systemctl enable cltg-update.timer
-systemctl start cltg-update.timer
-
-echo ""
-echo "✅ Установка завершена!"
-echo ""
-echo "Следующие шаги:"
-echo "  1. Заполните конфиг: nano $APP_DIR/.env"
-echo "  2. Запустите бота:   sudo systemctl start cltg-bot"
-echo "  3. Логи:             sudo journalctl -u cltg-bot -f"
-echo ""
+echo "Обновление бота: sudo bash $APP_DIR/update_bot.sh"

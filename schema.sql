@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS reminders (
     fired_at         DATETIME,
     idempotency_key  TEXT,
     meta_json        TEXT,
+    attempts         INTEGER  DEFAULT 0,   -- неудачные попытки отправки
     created_at       DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 

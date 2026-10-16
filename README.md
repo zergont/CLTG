@@ -8,7 +8,8 @@ Telegram-бот с поддержкой текста, изображений, д
 ## Возможности
 
 - 💬 **Диалог с Claude** — стриминг ответов в реальном времени
-- 🔍 **Веб-поиск** — бесплатный метапоиск ddgs (или SearXNG) через Claude tool use
+- 🔍 **Веб-поиск** — бесплатный метапоиск ddgs, запасной — SearXNG (Яндекс + Bing)
+- 💾 **Резервные копии** — ежедневная копия базы на сервере и еженедельная — администратору в Telegram
 - 🌐 **Чтение страниц** — бот открывает страницу или PDF по ссылке из сообщения или результатов поиска (web_fetch Anthropic, платятся только токены)
 - 🖼 **Изображения** — Claude Vision (base64 → нативно)
 - 📄 **Документы и PDF** — нативная поддержка Claude
@@ -40,6 +41,7 @@ cltg/
 │   │   ├── anthropic/
 │   │   │   ├── chat.py     # стриминг, саммаризация, сборка messages[]
 │   │   │   └── models.py   # реестр моделей: цены, уровни размышлений
+│   │   ├── backup.py       # ежедневные резервные копии базы
 │   │   ├── bug_report.py   # отправка ошибок из логов администратору
 │   │   ├── db.py           # все операции с SQLite
 │   │   ├── errors.py       # обработка ошибок API, ретраи
@@ -56,9 +58,7 @@ cltg/
 │   ├── searxng/
 │   │   └── settings.yml    # конфиг SearXNG (веб-поиск)
 │   └── systemd/
-│       ├── cltg-bot.service
-│       ├── cltg-update.service
-│       └── cltg-update.timer
+│       └── cltg-bot.service
 ├── .env.example            # шаблон конфигурации
 ├── .gitignore
 ├── pyproject.toml
@@ -180,38 +180,31 @@ sudo journalctl -u cltg-bot -f
 
 ---
 
-### Ручное обновление
+### Обновление
+
+Бот обновляется вручную, когда в `main` есть то, что нужно выкатить:
 
 ```bash
-cd /opt/cltg
-sudo bash update_bot.sh
+sudo bash /opt/cltg/update_bot.sh
 ```
 
-### Автообновление (systemd timer)
+Скрипт проверяет, что репозиторий на ветке `main` и без незакоммиченных правок,
+обновляется только «вперёд» (`--ff-only`), ставит зависимости, перезапускает бота
+и убеждается, что он поднялся (иначе показывает журнал). Ночного автообновления нет:
+на прод попадает только то, что выкатили осознанно.
 
-Таймер `cltg-update.timer` автоматически запускает `update_bot.sh` каждую ночь в 03:00.
+### Резервные копии
 
+Бот сам делает копию базы каждую ночь (`BACKUP_HOUR`, по UTC) в `/opt/cltg/backups/`,
+хранит последние `BACKUP_KEEP` и раз в `BACKUP_SEND_DAYS` дней присылает свежую копию
+администратору в Telegram — на случай, если пропадёт сам сервер. Копия по запросу: `/backup`.
+
+Восстановление из копии:
 ```bash
-# Статус таймера
-sudo systemctl status cltg-update.timer
-
-# Список активных таймеров
-sudo systemctl list-timers | grep cltg
-
-# Принудительный запуск обновления
-sudo systemctl start cltg-update.service
-```
-
-Для изменения расписания отредактируйте `/etc/systemd/system/cltg-update.timer`:
-```ini
-[Timer]
-OnCalendar=*-*-* 03:00:00   # каждую ночь в 03:00
-```
-
-После изменения:
-```bash
-sudo systemctl daemon-reload
-sudo systemctl restart cltg-update.timer
+sudo systemctl stop cltg-bot
+gunzip -c /opt/cltg/backups/cltg-2026-10-16_010000.db.gz > /opt/cltg/cltg.db
+sudo chown cltg:cltg /opt/cltg/cltg.db
+sudo systemctl start cltg-bot
 ```
 
 ---
@@ -220,13 +213,11 @@ sudo systemctl restart cltg-update.timer
 
 ```bash
 # 1. Останавливаем и отключаем
-sudo systemctl stop cltg-bot cltg-update.timer cltg-update.service
-sudo systemctl disable cltg-bot cltg-update.timer cltg-update.service
+sudo systemctl stop cltg-bot
+sudo systemctl disable cltg-bot
 
 # 2. Удаляем systemd-файлы
 sudo rm -f /etc/systemd/system/cltg-bot.service
-sudo rm -f /etc/systemd/system/cltg-update.service
-sudo rm -f /etc/systemd/system/cltg-update.timer
 sudo systemctl daemon-reload
 sudo systemctl reset-failed
 

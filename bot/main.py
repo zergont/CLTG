@@ -14,6 +14,7 @@ from bot.keyboards import setup_commands
 from bot.middlewares import RegisterUserMiddleware
 from bot.utils import db
 from bot.utils.anthropic.models import EFFORT_LABELS
+from bot.utils.backup import run_backup_scheduler
 from bot.utils.bug_report import setup_bug_reports
 from bot.utils.errors import handle_telegram_error
 from bot.utils.log import setup_logging
@@ -37,7 +38,7 @@ async def main() -> None:
     await db.init_db()
 
     # Проверка SearXNG
-    await init_searxng(config.searxng_url, config.search_engine)
+    await init_searxng(config.searxng_url, config.search_engine, config.searxng_engines)
 
     # Anthropic клиент
     client = anthropic.AsyncAnthropic(
@@ -110,10 +111,11 @@ async def main() -> None:
         except Exception as exc:
             await handle_telegram_error(exc, chat_id=config.admin_id, user_id=config.admin_id)
 
-    # Запуск планировщика напоминаний
-    scheduler_task = asyncio.create_task(
-        run_scheduler(bot, config, client)
-    )
+    # Фоновые задачи: напоминания и резервные копии базы
+    background_tasks = [
+        asyncio.create_task(run_scheduler(bot, config, client)),
+        asyncio.create_task(run_backup_scheduler(bot, config)),
+    ]
 
     # Уведомление о запуске — только администратору
     dp.startup.register(notify_admin_startup)
@@ -123,11 +125,9 @@ async def main() -> None:
     try:
         await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
     finally:
-        scheduler_task.cancel()
-        try:
-            await scheduler_task
-        except asyncio.CancelledError:
-            pass
+        for task in background_tasks:
+            task.cancel()
+        await asyncio.gather(*background_tasks, return_exceptions=True)
         await bot.session.close()
         await client.close()
         logger.info("Бот остановлен.")

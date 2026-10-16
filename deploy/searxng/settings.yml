@@ -13,13 +13,21 @@ server:
 outgoing:
   request_timeout: 10.0
 
+# С IP дата-центра Google («access denied»), DuckDuckGo и Startpage (капча),
+# Brave (429) и Qwant не отвечают. Яндекс и Bing работают — включаем их.
+# Бот всё равно передаёт движки явно (SEARXNG_ENGINES), это — для веб-интерфейса.
 engines:
+  - name: yandex
+    disabled: false
+  - name: bing
+    disabled: false
   - name: google
-    engine: google
-    shortcut: g
+    disabled: true
   - name: duckduckgo
-    engine: duckduckgo
-    shortcut: d
+    disabled: true
   - name: brave
-    engine: brave
-    shortcut: br
+    disabled: true
+  - name: startpage
+    disabled: true
+  - name: qwant
+    disabled: true

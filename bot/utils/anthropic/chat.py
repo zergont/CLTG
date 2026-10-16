@@ -9,7 +9,6 @@ from datetime import datetime, timezone as dt_timezone
 from typing import Any, AsyncGenerator
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-import aiosqlite
 import anthropic
 import httpx2
 
@@ -21,6 +20,8 @@ logger = logging.getLogger(__name__)
 # Режим поиска (auto | searxng | native) и доступность SearXNG — задаются init_searxng()
 _search_engine: str = "ddgs"
 _searxng_url: str = ""
+# Движки SearXNG для запросов (пусто — его настройки по умолчанию)
+_searxng_engines: str = ""
 _searxng_available: bool = False
 _searxng_checked_at: float = 0.0
 # В режиме auto недоступный SearXNG перепроверяется не чаще раза в N секунд
@@ -79,6 +80,15 @@ REMINDER_TOOL: dict = {
             "steps_left": {"type": "integer", "description": "Макс. число срабатываний (без поля = бессрочно)"},
             "end_at": {"type": "string", "description": "Дата окончания ISO 8601 UTC (без поля = бессрочно)"},
             "silent": {"type": "integer", "description": "1 = тихий режим, 0 = со звуком"},
+            "prompt": {
+                "type": "string",
+                "description": (
+                    "Только если в момент срабатывания нужно сгенерировать новый текст, а не "
+                    "повторить text: инструкция для Claude (например «пожелай доброго утра и "
+                    "предложи идею для зарядки»). Генерация идёт без доступа к интернету. "
+                    "Без поля — отправляется text."
+                ),
+            },
         },
         "required": ["text", "due_at"],
     },
@@ -123,8 +133,8 @@ def _native_web_search_tool(model: ModelInfo) -> dict:
 async def _search_tool(model: ModelInfo) -> dict:
     """Инструмент поиска для запроса с учётом режима SEARCH_ENGINE.
 
-    ddgs    — бесплатный метапоиск ddgs (тот же клиентский инструмент web_search);
-    searxng — всегда бесплатный SearXNG (если он лежит, модель получит «поиск недоступен»);
+    ddgs    — бесплатный ddgs, запасной — SearXNG (клиентский инструмент web_search);
+    searxng — бесплатный SearXNG, запасной — ddgs;
     native  — всегда платный нативный поиск;
     auto    — SearXNG, а платный только пока SearXNG недоступен (с периодической перепроверкой).
     """
@@ -163,6 +173,14 @@ class TurnUsage:
         self.context_tokens = usage.input_tokens + cache_write + cache_read + usage.output_tokens
 
 
+def _parse_tool_time(value: str) -> datetime:
+    """Время из инструмента → UTC (модель может прислать и «Z», и смещение «+03:00»)."""
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=dt_timezone.utc)
+    return dt.astimezone(dt_timezone.utc)
+
+
 async def _execute_reminder_tool(
     tool_input: dict,
     chat_id: int,
@@ -173,15 +191,8 @@ async def _execute_reminder_tool(
     from bot.utils import db as _db
     try:
         text = tool_input.get("text", "")
-        due_at = datetime.fromisoformat(tool_input["due_at"].replace("Z", "+00:00"))
-        if due_at.tzinfo is None:
-            due_at = due_at.replace(tzinfo=dt_timezone.utc)
-
-        end_at = None
-        if tool_input.get("end_at"):
-            end_at = datetime.fromisoformat(tool_input["end_at"].replace("Z", "+00:00"))
-            if end_at.tzinfo is None:
-                end_at = end_at.replace(tzinfo=dt_timezone.utc)
+        due_at = _parse_tool_time(tool_input["due_at"])
+        end_at = _parse_tool_time(tool_input["end_at"]) if tool_input.get("end_at") else None
 
         is_chain = bool(tool_input.get("is_chain", False))
         silent = int(tool_input.get("silent", 1 if default_silent else 0))
@@ -198,15 +209,8 @@ async def _execute_reminder_tool(
             silent=silent,
             steps_left=steps_left,
             end_at=end_at,
+            interval_seconds=interval_seconds,
         )
-
-        if interval_seconds:
-            async with aiosqlite.connect(_db.DB_PATH) as conn:
-                await conn.execute(
-                    "UPDATE reminders SET meta_json = ? WHERE id = ?",
-                    (json.dumps({"interval_seconds": interval_seconds}), reminder_id),
-                )
-                await conn.commit()
 
         chain_mark = " 🔁" if is_chain else ""
         silent_mark = " 🔕" if silent else ""
@@ -249,74 +253,103 @@ async def _check_searxng() -> bool:
     return _searxng_available
 
 
-async def init_searxng(url: str, engine: str = "ddgs") -> bool:
+async def init_searxng(url: str, engine: str = "ddgs", engines: str = "yandex,bing") -> bool:
     """Задаёт режим поиска и проверяет SearXNG. Вызывается при старте бота.
 
-    engine: searxng (только бесплатный SearXNG) | ddgs (DuckDuckGo через ddgs) |
-            auto (SearXNG, при сбое — платный) | native (платный Anthropic web_search)
+    engine: ddgs (ddgs, запасной — SearXNG) | searxng (SearXNG, запасной — ddgs) |
+            auto (SearXNG, при недоступности — платный) | native (платный Anthropic web_search)
+    engines: движки SearXNG — на IP дата-центра Google/DuckDuckGo/Brave/Startpage блокируют,
+             а Яндекс и Bing отвечают
     """
-    global _search_engine, _searxng_url
+    global _search_engine, _searxng_url, _searxng_engines
     _search_engine = engine if engine in ("auto", "searxng", "native", "ddgs") else "ddgs"
     _searxng_url = url
+    _searxng_engines = engines
 
     if _search_engine == "native":
         logger.info("🔍 Поисковый движок: нативный Anthropic web_search (платный)")
         return False
     if _search_engine == "ddgs":
-        logger.info("🔍 Поисковый движок: ddgs (DuckDuckGo, бесплатный)")
+        logger.info("🔍 Поисковый движок: ddgs, запасной — SearXNG (%s)", engines or "по умолчанию")
         return True
     return await _check_searxng()
 
 
-async def _searxng_search(query: str, searxng_url: str, max_results: int = 5) -> str:
-    """HTTP-запрос к SearXNG, возвращает текст с результатами."""
+SearchResults = list[dict[str, str]]
+
+
+async def _searxng_search(query: str, max_results: int = 5) -> SearchResults | None:
+    """Поиск через SearXNG. None — ошибка или пустой ответ (причина пишется в лог)."""
+    params = {"q": query, "format": "json"}
+    if _searxng_engines:
+        params["engines"] = _searxng_engines
+    else:
+        params["categories"] = "general"
     try:
         async with httpx2.AsyncClient(timeout=10.0) as client:
-            r = await client.get(
-                f"{searxng_url}/search",
-                params={"q": query, "format": "json", "categories": "general"},
-            )
+            r = await client.get(f"{_searxng_url}/search", params=params)
             r.raise_for_status()
             data = r.json()
-            results = data.get("results", [])[:max_results]
-            if not results:
-                return "Поиск не вернул результатов."
-            lines = []
-            for i, item in enumerate(results, 1):
-                title = item.get("title", "")
-                url = item.get("url", "")
-                content = item.get("content", "")
-                lines.append(f"{i}. {title}\n   URL: {url}\n   {content}")
-            return "\n\n".join(lines)
     except Exception as exc:
-        logger.warning("Ошибка SearXNG поиска: %s", exc)
-        return f"Поиск временно недоступен: {exc}"
+        logger.warning("SearXNG недоступен: %s", exc)
+        return None
+
+    results = [
+        {"title": item.get("title", ""), "url": item.get("url", ""), "content": item.get("content", "")}
+        for item in data.get("results", [])[:max_results]
+    ]
+    if not results:
+        logger.warning("SearXNG ничего не нашёл (недоступные движки: %s)", data.get("unresponsive_engines"))
+        return None
+    return results
 
 
-def _ddgs_search_sync(query: str, max_results: int = 5) -> str:
-    """Синхронный поиск через ddgs (DuckDuckGo), вызывается в отдельном потоке."""
+def _ddgs_search_sync(query: str, max_results: int = 5) -> SearchResults | None:
+    """Синхронный поиск через ddgs, вызывается в отдельном потоке."""
     from ddgs import DDGS
 
     try:
         with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=max_results))
-        if not results:
-            return "Поиск не вернул результатов."
-        lines = []
-        for i, item in enumerate(results, 1):
-            title = item.get("title", "")
-            url = item.get("href", "") or item.get("url", "")
-            content = item.get("body", "") or item.get("content", "")
-            lines.append(f"{i}. {title}\n   URL: {url}\n   {content}")
-        return "\n\n".join(lines)
+            items = list(ddgs.text(query, max_results=max_results))
     except Exception as exc:
         logger.warning("Ошибка ddgs поиска: %s", exc)
-        return f"Поиск временно недоступен: {exc}"
+        return None
+    if not items:
+        logger.warning("ddgs ничего не нашёл")
+        return None
+    return [
+        {
+            "title": item.get("title", ""),
+            "url": item.get("href", "") or item.get("url", ""),
+            "content": item.get("body", "") or item.get("content", ""),
+        }
+        for item in items
+    ]
 
 
-async def _ddgs_search(query: str, max_results: int = 5) -> str:
+async def _ddgs_search(query: str, max_results: int = 5) -> SearchResults | None:
     """Асинхронная обёртка над ddgs (синхронная библиотека — в отдельном потоке)."""
     return await asyncio.to_thread(_ddgs_search_sync, query, max_results)
+
+
+def _format_results(results: SearchResults) -> str:
+    return "\n\n".join(
+        f"{i}. {r['title']}\n   URL: {r['url']}\n   {r['content']}"
+        for i, r in enumerate(results, 1)
+    )
+
+
+async def _free_search(query: str) -> str:
+    """Бесплатный поиск: основной движок, а если он упал или ничего не нашёл — запасной."""
+    backends = {"ddgs": _ddgs_search, "searxng": _searxng_search}
+    order = ["searxng", "ddgs"] if _search_engine in ("searxng", "auto") else ["ddgs", "searxng"]
+    for attempt, name in enumerate(order):
+        results = await backends[name](query)
+        if results:
+            if attempt:
+                logger.info("Поиск «%s»: основной движок не ответил, результаты от запасного (%s)", query, name)
+            return _format_results(results)
+    return "Поиск ничего не нашёл или временно недоступен. Попробуй переформулировать запрос."
 
 
 def _cache_control(ttl: str) -> dict:
@@ -369,7 +402,9 @@ def _build_system_prompt(config: Config) -> list[dict]:
         "- Установи `is_chain: true` и `interval_seconds` (3600=час, 86400=день, 604800=неделя)\n"
         "- `steps_left` — ограничить число повторений (без параметра = бессрочно)\n"
         "- `end_at` — дата окончания в UTC (без параметра = бессрочно)\n"
-        "- `silent` — 1=без звука (по умолчанию), 0=со звуком\n\n"
+        "- `silent` — 1=без звука (по умолчанию), 0=со звуком\n"
+        "- `prompt` — только если при срабатывании нужно сгенерировать новый текст "
+        "(пожелание, идея, шутка), а не повторить `text`; генерация идёт без интернета\n\n"
         "### 🧠 Память и контекст\n"
         "Ты ведёшь непрерывный диалог с пользователем. Между сессиями сохраняется "
         "структурированное саммари предыдущих разговоров. Запоминай и используй:\n"
@@ -682,16 +717,8 @@ async def stream_response(
         # Поисковые запросы выполняем параллельно
         if search_blocks:
             queries = [b.input.get("query", "") for b in search_blocks]  # type: ignore[union-attr]
-            if _search_engine == "ddgs":
-                logger.info("ddgs поиск (%d запросов): %s", len(queries), queries)
-                search_results = await asyncio.gather(
-                    *[_ddgs_search(q) for q in queries]
-                )
-            else:
-                logger.info("SearXNG поиск (%d запросов): %s", len(queries), queries)
-                search_results = await asyncio.gather(
-                    *[_searxng_search(q, config.searxng_url) for q in queries]
-                )
+            logger.info("Поиск (%d запросов): %s", len(queries), queries)
+            search_results = await asyncio.gather(*[_free_search(q) for q in queries])
             tool_results.extend(
                 {
                     "type": "tool_result",

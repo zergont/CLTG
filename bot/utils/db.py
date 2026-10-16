@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import aiosqlite
 
@@ -17,6 +17,23 @@ from bot.utils.anthropic.models import (
 logger = logging.getLogger(__name__)
 
 DB_PATH = "cltg.db"
+
+# Через сколько секунд взятое, но не завершённое напоминание можно взять повторно
+PICK_TIMEOUT_SECONDS = 60
+# Сколько раз пробовать отправить напоминание, прежде чем пометить его failed
+REMINDER_MAX_ATTEMPTS = 3
+
+
+def utc_iso(dt: datetime) -> str:
+    """Время для хранения в БД: всегда UTC, с точностью до секунд.
+
+    Времена в БД сравниваются как строки, поэтому формат должен быть единым
+    (раньше смешивались «2026-10-16T10:00:00.123+00:00», «+03:00» и
+    «2026-10-16 10:00:00» из SQLite — из-за этого напоминания залипали).
+    """
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat(timespec="seconds")
 
 
 async def init_db() -> None:
@@ -67,6 +84,26 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
         await conn.execute("UPDATE users SET is_approved = TRUE WHERE is_banned = FALSE")
         await conn.commit()
         logger.info("Миграция: доступ по одобрению, текущие пользователи одобрены")
+
+    # reminders: счётчик попыток и единый формат времени в UTC (v1.4.0)
+    cursor = await conn.execute("PRAGMA table_info(reminders)")
+    reminder_columns = {row[1] for row in await cursor.fetchall()}
+    if "attempts" not in reminder_columns:
+        await conn.execute("ALTER TABLE reminders ADD COLUMN attempts INTEGER DEFAULT 0")
+        cursor = await conn.execute(
+            "SELECT id, due_at, end_at FROM reminders WHERE status = 'scheduled'"
+        )
+        for reminder_id, due_at, end_at in await cursor.fetchall():
+            await conn.execute(
+                "UPDATE reminders SET due_at = ?, end_at = ?, picked_at = NULL WHERE id = ?",
+                (
+                    utc_iso(datetime.fromisoformat(due_at)),
+                    utc_iso(datetime.fromisoformat(end_at)) if end_at else None,
+                    reminder_id,
+                ),
+            )
+        await conn.commit()
+        logger.info("Миграция: напоминания приведены к UTC, добавлен счётчик попыток")
 
     # bot_settings: устаревшие модели → актуальные (v1.2.0)
     cursor = await conn.execute("SELECT value FROM bot_settings WHERE key = 'current_model'")
@@ -410,22 +447,25 @@ async def add_reminder(
     steps_left: int | None = None,
     end_at: datetime | None = None,
     idempotency_key: str | None = None,
+    interval_seconds: int | None = None,
 ) -> int:
+    meta = {"interval_seconds": interval_seconds} if interval_seconds else None
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             """
             INSERT INTO reminders
                 (chat_id, user_id, text, prompt, is_chain, due_at, silent,
-                 steps_left, end_at, idempotency_key)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 steps_left, end_at, idempotency_key, meta_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 chat_id, user_id, text, prompt, is_chain,
-                due_at.isoformat(),
+                utc_iso(due_at),
                 silent,
                 steps_left,
-                end_at.isoformat() if end_at else None,
+                utc_iso(end_at) if end_at else None,
                 idempotency_key,
+                json.dumps(meta) if meta else None,
             ),
         )
         await db.commit()
@@ -477,10 +517,9 @@ async def pick_due_reminders(
     Атомарно выбирает напоминания, готовые к отправке.
     picked_at защищает от двойного срабатывания.
     """
-    cutoff = datetime.fromtimestamp(
-        now.timestamp() + lookahead_seconds, tz=timezone.utc
-    ).isoformat()
-    now_iso = now.isoformat()
+    cutoff = utc_iso(now + timedelta(seconds=lookahead_seconds))
+    stale_before = utc_iso(datetime.now(timezone.utc) - timedelta(seconds=PICK_TIMEOUT_SECONDS))
+    now_iso = utc_iso(now)
 
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -489,11 +528,11 @@ async def pick_due_reminders(
             SELECT * FROM reminders
             WHERE status = 'scheduled'
               AND due_at <= ?
-              AND (picked_at IS NULL OR picked_at < datetime('now', '-60 seconds'))
+              AND (picked_at IS NULL OR picked_at < ?)
             ORDER BY due_at
             LIMIT ?
             """,
-            (cutoff, batch_limit),
+            (cutoff, stale_before, batch_limit),
         ) as cur:
             rows = await cur.fetchall()
 
@@ -522,22 +561,40 @@ async def complete_reminder(
     async with aiosqlite.connect(DB_PATH) as db:
         if reschedule_at is None:
             await db.execute(
-                "UPDATE reminders SET status = 'done', executed_at = ? WHERE id = ?",
-                (datetime.now(timezone.utc).isoformat(), reminder_id),
+                "UPDATE reminders SET status = 'done', executed_at = ?, attempts = 0 WHERE id = ?",
+                (utc_iso(datetime.now(timezone.utc)), reminder_id),
             )
         else:
             await db.execute(
                 """
                 UPDATE reminders
                 SET due_at = ?, steps_left = ?, fired_at = ?,
-                    picked_at = NULL
+                    picked_at = NULL, attempts = 0
                 WHERE id = ?
                 """,
                 (
-                    reschedule_at.isoformat(),
+                    utc_iso(reschedule_at),
                     steps_left,
-                    datetime.now(timezone.utc).isoformat(),
+                    utc_iso(datetime.now(timezone.utc)),
                     reminder_id,
                 ),
             )
         await db.commit()
+
+
+async def fail_reminder(reminder_id: int) -> bool:
+    """Учитывает неудачную попытку отправки.
+
+    Напоминание остаётся взятым и повторится через PICK_TIMEOUT_SECONDS.
+    После REMINDER_MAX_ATTEMPTS неудач — статус failed. Возвращает True, если сдались.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE reminders SET attempts = COALESCE(attempts, 0) + 1 WHERE id = ?", (reminder_id,)
+        )
+        cur = await db.execute(
+            "UPDATE reminders SET status = 'failed' WHERE id = ? AND attempts >= ?",
+            (reminder_id, REMINDER_MAX_ATTEMPTS),
+        )
+        await db.commit()
+        return cur.rowcount > 0

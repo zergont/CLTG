@@ -63,6 +63,11 @@ class Config:
     reminder_jitter: int          # секунды
     reminder_default_silent: bool
 
+    # Резервные копии базы
+    backup_hour: int        # после какого часа (UTC) делать ежедневную копию
+    backup_keep: int        # сколько копий хранить на сервере
+    backup_send_days: int   # раз в сколько дней присылать копию админу (0 — не присылать)
+
     # Отладка
     debug_mode: bool
     bug_reports: bool   # отправлять ошибки из логов администратору
@@ -74,6 +79,7 @@ class Config:
 
     # SearXNG
     searxng_url: str
+    searxng_engines: str  # движки SearXNG через запятую (на IP дата-центра работают yandex, bing)
     search_engine: str  # ddgs | searxng | auto | native
 
 
@@ -102,11 +108,15 @@ def load_config() -> Config:
         reminder_lookahead=_parse_duration_seconds(os.getenv("REMINDER_LOOKAHEAD", "2s")),
         reminder_jitter=_parse_duration_seconds(os.getenv("REMINDER_JITTER", "2s")),
         reminder_default_silent=bool(int(os.getenv("REMINDER_DEFAULT_SILENT", "1"))),
+        backup_hour=int(os.getenv("BACKUP_HOUR", "1")),
+        backup_keep=max(1, int(os.getenv("BACKUP_KEEP", "14"))),
+        backup_send_days=int(os.getenv("BACKUP_SEND_DAYS", "7")),
         debug_mode=bool(int(os.getenv("DEBUG_MODE", "0"))),
         bug_reports=bool(int(os.getenv("BUG_REPORTS", "1"))),
         web_fetch=bool(int(os.getenv("WEB_FETCH", "1"))),
         web_fetch_max_tokens=int(os.getenv("WEB_FETCH_MAX_TOKENS", "20000")),
         web_fetch_max_uses=int(os.getenv("WEB_FETCH_MAX_USES", "5")),
         searxng_url=os.getenv("SEARXNG_URL", "http://localhost:8888"),
+        searxng_engines=os.getenv("SEARXNG_ENGINES", "yandex,bing").replace(" ", ""),
         search_engine=os.getenv("SEARCH_ENGINE", "ddgs"),
     )

@@ -29,6 +29,7 @@ ADMIN_COMMANDS = USER_COMMANDS + [
     BotCommand(command="users",   description="Список пользователей"),
     BotCommand(command="usage",   description="Общая статистика расходов"),
     BotCommand(command="context", description="Заполнение контекстного окна"),
+    BotCommand(command="backup",  description="Резервная копия базы файлом"),
 ]
 
 
