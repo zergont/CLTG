@@ -6,7 +6,8 @@ import logging
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone as dt_timezone
-from typing import Any, AsyncGenerator
+from typing import Any, AsyncGenerator, Awaitable, Callable
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import anthropic
@@ -634,6 +635,50 @@ def _echo_content(content: list[Any]) -> list[Any]:
     return kept + content[boundary + 1:]
 
 
+# Колбэк статуса: «💭 Думаю…», «🔍 Ищу в интернете: …», «🌐 Читаю страницу: …»
+StatusCallback = Callable[[str], Awaitable[None]]
+
+STATUS_THINKING = "💭 Думаю…"
+STATUS_FILTERING = "📑 Выбираю нужное…"
+# Серверные инструменты, через которые web_fetch/web_search фильтруют найденное
+_FILTERING_TOOLS = {"code_execution", "bash_code_execution", "text_editor_code_execution"}
+
+
+def _short(text: str, limit: int = 60) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _search_status(queries: list[str]) -> str:
+    queries = [q for q in queries if q] or ["…"]
+    more = f" и ещё {len(queries) - 1}" if len(queries) > 1 else ""
+    return f"🔍 Ищу в интернете: «{_short(queries[0])}»{more}"
+
+
+def _tool_status(name: str, tool_input: dict) -> str | None:
+    if name == "web_search":
+        return _search_status([tool_input.get("query", "")])
+    if name == "web_fetch":
+        # Без адреса (служебный вызов изнутри фильтрации) статус ничего не сообщает
+        domain = urlparse(tool_input.get("url", "")).netloc.removeprefix("www.")
+        return f"🌐 Читаю страницу: {domain}" if domain else None
+    if name in _FILTERING_TOOLS:
+        return STATUS_FILTERING
+    return None
+
+
+def _status_for_event(event: Any) -> str | None:
+    """Статус по событию стрима: начало размышлений или вызов серверного инструмента."""
+    block = getattr(event, "content_block", None)
+    block_type = getattr(block, "type", None)
+    if event.type == "content_block_start" and block_type in ("thinking", "redacted_thinking"):
+        return STATUS_THINKING
+    # Адрес страницы известен только к концу блока — тогда и показываем
+    if event.type == "content_block_stop" and block_type == "server_tool_use":
+        return _tool_status(block.name, block.input or {})
+    return None
+
+
 async def stream_response(
     client: anthropic.AsyncAnthropic,
     config: Config,
@@ -643,6 +688,7 @@ async def stream_response(
     system: list[dict],
     chat_id: int = 0,
     user_id: int = 0,
+    on_status: StatusCallback | None = None,
 ) -> AsyncGenerator[tuple[str, TurnUsage | None], None]:
     """Async generator: стриминг ответа Claude.
 
@@ -651,7 +697,13 @@ async def stream_response(
 
     Yields (chunk_text, None) для каждого текстового чанка.
     Финальный yield: ("", usage) с суммарным usage всех вызовов.
+    on_status получает короткие статусы («💭 Думаю…», «🔍 Ищу…»), пока текста нет.
     """
+
+    async def status(text: str | None) -> None:
+        if text and on_status is not None:
+            await on_status(text)
+
     usage = TurnUsage()
     current_messages = list(messages)
     has_text = False
@@ -670,12 +722,15 @@ async def stream_response(
         separator_pending = has_text
 
         async with _open_stream(client, model, params) as stream:
-            async for text_chunk in stream.text_stream:
-                if separator_pending:
-                    yield "\n\n", None
-                    separator_pending = False
-                has_text = True
-                yield text_chunk, None
+            async for event in stream:
+                if event.type == "text":
+                    if separator_pending:
+                        yield "\n\n", None
+                        separator_pending = False
+                    has_text = True
+                    yield event.text, None
+                else:
+                    await status(_status_for_event(event))
             final_msg = await stream.get_final_message()
 
         usage.add(model, final_msg)
@@ -718,6 +773,7 @@ async def stream_response(
         if search_blocks:
             queries = [b.input.get("query", "") for b in search_blocks]  # type: ignore[union-attr]
             logger.info("Поиск (%d запросов): %s", len(queries), queries)
+            await status(_search_status(queries))
             search_results = await asyncio.gather(*[_free_search(q) for q in queries])
             tool_results.extend(
                 {
@@ -731,6 +787,7 @@ async def stream_response(
         # Напоминания создаём последовательно (запись в БД)
         for block in reminder_blocks:
             logger.info("Создание напоминания через tool: %s", block.input)
+            await status("⏰ Создаю напоминание…")
             result = await _execute_reminder_tool(
                 block.input,  # type: ignore[arg-type]
                 chat_id,
@@ -896,6 +953,7 @@ def process_message(
     user_tz: str,
     db_history: dict,
     user_name: str | None = None,
+    on_status: StatusCallback | None = None,
 ) -> AsyncGenerator[tuple[str, TurnUsage | None], None]:
     """Точка входа для обработки входящего сообщения.
 
@@ -911,5 +969,6 @@ def process_message(
         live_history, summary, new_content, turn_context, cache_ttl=config.cache_ttl,
     )
     return stream_response(
-        client, config, model, effort, messages, system, chat_id=chat_id, user_id=user_id,
+        client, config, model, effort, messages, system,
+        chat_id=chat_id, user_id=user_id, on_status=on_status,
     )

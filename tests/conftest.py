@@ -59,9 +59,12 @@ def make_message(content, stop_reason="end_turn", model="claude-haiku-5-5", usag
 
 
 class FakeStream:
-    def __init__(self, texts, final):
-        self._texts = texts
+    """Стрим SDK: сначала служебные события (events), затем текстовые."""
+
+    def __init__(self, texts, final, events=()):
+        self._texts = texts or []
         self._final = final
+        self._events = list(events)
 
     async def __aenter__(self):
         return self
@@ -69,12 +72,11 @@ class FakeStream:
     async def __aexit__(self, *exc):
         return False
 
-    @property
-    def text_stream(self):
-        async def gen():
-            for t in self._texts:
-                yield t
-        return gen()
+    async def __aiter__(self):
+        for event in self._events:
+            yield event
+        for t in self._texts:
+            yield SimpleNamespace(type="text", text=t)
 
     async def get_final_message(self):
         return self._final
@@ -89,8 +91,7 @@ class FakeMessages:
 
     def stream(self, **params):
         self.calls.append(params)
-        texts, final = self.responses.pop(0)
-        return FakeStream(texts, final)
+        return FakeStream(*self.responses.pop(0))
 
     async def create(self, **params):
         self.calls.append(params)

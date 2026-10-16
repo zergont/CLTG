@@ -259,6 +259,24 @@ async def cb_rem(callback: CallbackQuery, config: "Config", **kwargs) -> None:
     await callback.answer()
 
 
+VOICE_REPLY = (
+    "🎙 Голосовые и аудио я пока не понимаю — напишите, пожалуйста, текстом.\n\n"
+    "<i>Подсказка: в Telegram голосовое можно расшифровать в текст кнопкой «→A» "
+    "(с Telegram Premium) и прислать мне.</i>"
+)
+UNSUPPORTED_REPLY = (
+    "🤷 Такое сообщение я пока не умею разбирать.\n"
+    "Понимаю текст, фото и документы (PDF, TXT, CSV, JSON, HTML)."
+)
+
+
+@router.message(F.voice | F.video_note | F.audio)
+async def handle_voice(message: Message, **kwargs) -> None:
+    """Голосовые, «кружочки» и аудио — вежливый ответ вместо молчания (только в личке)."""
+    if message.chat.type == "private":
+        await message.answer(VOICE_REPLY, parse_mode="HTML")
+
+
 @router.message()
 async def handle_text(
     message: Message,
@@ -268,6 +286,9 @@ async def handle_text(
 ) -> None:
     """Обрабатывает все текстовые сообщения."""
     if not message.text:
+        # Видео, геолокация, контакт и т.п. — подсказка; стикеры молча пропускаем
+        if message.chat.type == "private" and not message.sticker:
+            await message.answer(UNSUPPORTED_REPLY)
         return
 
     await handle_incoming(

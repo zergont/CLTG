@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import time
@@ -120,6 +121,51 @@ async def reset_dialogue(
     return True
 
 
+def render_progress(text: str, status: str | None) -> str:
+    """Промежуточный вид ответа: готовый текст с курсором и/или статус курсивом."""
+    parts = []
+    if text:
+        parts.append(markdown_to_html(text) + ("" if status else " ▌"))
+    if status:
+        parts.append(f"<i>{html.escape(status)}</i>")
+    return "\n\n".join(parts) or "⏳"
+
+
+class _Progress:
+    """Сообщение-заглушка, которое обновляется по ходу ответа."""
+
+    def __init__(self, message: "Message") -> None:
+        self.message = message
+        self.text = ""
+        self.status: str | None = None
+        self._shown = ""
+        self._last_edit = time.monotonic()
+
+    async def add_text(self, chunk: str) -> None:
+        self.text += chunk
+        self.status = None  # пошёл текст — статус больше не нужен
+        if time.monotonic() - self._last_edit >= STREAM_UPDATE_INTERVAL:
+            await self._show()
+
+    async def set_status(self, status: str) -> None:
+        if status != self.status:
+            self.status = status
+            await self._show()
+
+    async def _show(self) -> None:
+        if len(self.text) > TELEGRAM_SAFE_LENGTH:
+            return  # длинный ответ целиком придёт в конце
+        rendered = render_progress(self.text, self.status)
+        if rendered == self._shown:
+            return
+        self._last_edit = time.monotonic()
+        try:
+            await self.message.edit_text(rendered, parse_mode="HTML")
+            self._shown = rendered
+        except Exception:
+            pass  # частые правки Telegram иногда отклоняет — не страшно
+
+
 async def _send_answer(placeholder: "Message", message: "Message", text: str) -> None:
     """Отправляет готовый ответ: первая часть — в сообщение-заглушку, остальные — новыми.
 
@@ -170,8 +216,9 @@ async def handle_incoming(
         if hours_silent >= config.summary_trigger_hours:
             timeout_summary_needed = True
 
-    # Заглушка "печатает..."
+    # Заглушка: в ней по ходу работы видны текст ответа и статус («💭 Думаю…», «🔍 Ищу…»)
     thinking_msg = await message.answer("⏳")
+    progress = _Progress(thinking_msg)
 
     full_text = ""
     usage: TurnUsage | None = None
@@ -193,28 +240,15 @@ async def handle_incoming(
                 message.from_user.last_name,  # type: ignore[union-attr]
                 message.from_user.username,  # type: ignore[union-attr]
             ),
+            on_status=progress.set_status,
         )
-
-        last_edit = time.monotonic()
 
         async for chunk, chunk_usage in gen:
             if chunk:
-                full_text += chunk
-                now = time.monotonic()
-                if (
-                    now - last_edit >= STREAM_UPDATE_INTERVAL
-                    and len(full_text) <= TELEGRAM_SAFE_LENGTH
-                ):
-                    try:
-                        await thinking_msg.edit_text(
-                            markdown_to_html(full_text) + " ▌",
-                            parse_mode="HTML",
-                        )
-                        last_edit = now
-                    except Exception:
-                        pass
+                await progress.add_text(chunk)
             if chunk_usage:
                 usage = chunk_usage
+        full_text = progress.text
 
     except Exception as exc:
         # Нет денег — срочное оповещение админу; временный сбой — WARNING;
