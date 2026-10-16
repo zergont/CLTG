@@ -253,13 +253,13 @@ async def _check_searxng() -> bool:
     return _searxng_available
 
 
-async def init_searxng(url: str, engine: str = "ddgs", engines: str = "yandex,bing") -> bool:
+async def init_searxng(url: str, engine: str = "ddgs", engines: str = "yandex") -> bool:
     """Задаёт режим поиска и проверяет SearXNG. Вызывается при старте бота.
 
     engine: ddgs (ddgs, запасной — SearXNG) | searxng (SearXNG, запасной — ddgs) |
             auto (SearXNG, при недоступности — платный) | native (платный Anthropic web_search)
     engines: движки SearXNG — на IP дата-центра Google/DuckDuckGo/Brave/Startpage блокируют,
-             а Яндекс и Bing отвечают
+             а Яндекс отвечает (Bing отвечает, но с привязкой к региону IP сервера)
     """
     global _search_engine, _searxng_url, _searxng_engines
     _search_engine = engine if engine in ("auto", "searxng", "native", "ddgs") else "ddgs"

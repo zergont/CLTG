@@ -79,7 +79,7 @@ class Config:
 
     # SearXNG
     searxng_url: str
-    searxng_engines: str  # движки SearXNG через запятую (на IP дата-центра работают yandex, bing)
+    searxng_engines: str  # движки SearXNG через запятую (на IP дата-центра стабильно работает yandex)
     search_engine: str  # ddgs | searxng | auto | native
 
 
@@ -117,6 +117,6 @@ def load_config() -> Config:
         web_fetch_max_tokens=int(os.getenv("WEB_FETCH_MAX_TOKENS", "20000")),
         web_fetch_max_uses=int(os.getenv("WEB_FETCH_MAX_USES", "5")),
         searxng_url=os.getenv("SEARXNG_URL", "http://localhost:8888"),
-        searxng_engines=os.getenv("SEARXNG_ENGINES", "yandex,bing").replace(" ", ""),
+        searxng_engines=os.getenv("SEARXNG_ENGINES", "yandex").replace(" ", ""),
         search_engine=os.getenv("SEARCH_ENGINE", "ddgs"),
     )
